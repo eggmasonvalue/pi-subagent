@@ -1,13 +1,19 @@
 {
   "name": "@eggmasonvalue/pi-subagent",
   "version": "1.0.0",
-  "description": "Observable, isolated-context subagents for pi — abort-flush partials, first-class resume, lean machine-facing envelope, optional model allowlist.",
+  "description": "Observable, steerable, isolated-context subagents for pi — resume any child mid-task, flush partial results on interrupt/timeout, lean machine-facing envelope, optional model allowlist.",
   "keywords": [
     "pi-package",
     "pi",
     "subagent",
+    "subagents",
     "agents",
-    "orchestration"
+    "orchestration",
+    "resume",
+    "steerable",
+    "observability",
+    "fault-tolerant",
+    "isolated-context"
   ],
   "license": "MIT",
   "author": "eggmasonvalue",
