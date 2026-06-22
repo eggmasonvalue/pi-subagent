@@ -2,10 +2,11 @@
 
 Delegate a task to a subagent that runs in its **own isolated context** (a separate `pi`
 process), then hand the result back to the main agent — while keeping the main agent's
-context window clean and **every child fully observable**.
+context window clean and **every child fully observable *and* steerable**.
 
 This is a deliberately *thin* primitive. The main agent is the intelligence; this tool
-just gives it a clean way to spawn isolated work and get a pointer back.
+just gives it a clean way to spawn isolated work, **read the receipts, and steer or resume
+any child** — including after an interrupt or timeout, without losing the work already done.
 
 ---
 
@@ -40,13 +41,18 @@ because this extension is built to answer each one:
 
 | The usual complaint | What this extension does |
 |---|---|
-| **"Black box within a black box."** You can't see what the subagent did. | Each child's **full transcript is persisted to a session JSONL**, and the file path is returned in the result. You (or the main agent) can open it and read every step. |
-| **Painful to debug.** If a child makes a mistake, you can't replay its conversation. | The session file is a normal pi session. `read` it, or resume it with `pi --session <file>` / `/tree` to inspect or continue the exact run. |
-| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden. |
+| **"Black box within a black box."** You can't see what the subagent did. | Each child's **full transcript is persisted to a session JSONL**, and the file path is returned in the result — in a terse `[status=… model=… session=…]` envelope so the supervisor sees *which model ran and how it went* without opening anything. You (or the main agent) can open the JSONL and read every step. |
+| **Painful to debug.** If a child makes a mistake, you can't replay or correct its conversation. | **`resume` is first-class.** The session file is a normal pi session: `read` it to diagnose, then `subagent { resume, task: <correction> }` to continue the **same** context with a steering prompt — the child keeps everything it learned, plus your fix. Inspect → steer → continue, no lost work. |
+| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden — and on `resume` the correction is just the next turn. |
 | **Context pollution.** People reach for subagents mid-session to "save context," then dump tool output back into the parent anyway. | The model only sees the child's **final output** (capped), not its streaming internals. Full detail lives in the session file and tool `details`, off to the side. |
+| **All-or-nothing on interrupt.** Kill a fan-out and you lose the work that already finished. | **Abort & timeout flush partial results.** On Ctrl+C / `/interrupt` / `timeoutMs`, completed tasks return their full output, in-flight tasks return partial output, and **every task keeps its own session path** — each one inspectable and `resume`-able. No work silently discarded, no sessions-dir archaeology. |
 
 The net effect: you get the *one* genuinely useful property of subagents — an **isolated
 context window for a focused sub-task** — without giving up observability or steerability.
+Two features make that real rather than aspirational:
+
+- **`resume`** turns every child into something you can *inspect, correct, and continue* — the steerability a black-box subagent can't offer.
+- **abort/timeout partial-flush** means interrupting is safe: you never trade away finished work to stop a runaway, and the receipts for *un*finished work are right there to resume from.
 
 ### Why no persona files
 
