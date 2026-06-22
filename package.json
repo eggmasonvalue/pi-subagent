@@ -1,5 +1,5 @@
 {
-  "name": "pi-subagent",
+  "name": "@eggmasonvalue/pi-subagent",
   "version": "1.0.0",
   "description": "Observable, isolated-context subagents for pi — abort-flush partials, first-class resume, lean machine-facing envelope, optional model allowlist.",
   "keywords": [

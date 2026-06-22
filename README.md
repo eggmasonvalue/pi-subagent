@@ -16,7 +16,7 @@ just gives it a clean way to spawn isolated work and get a pointer back.
 pi install git:github.com/eggmasonvalue/pi-subagent
 
 # or npm
-pi install npm:pi-subagent
+pi install npm:@eggmasonvalue/pi-subagent
 
 # try it for one run without installing
 pi -e git:github.com/eggmasonvalue/pi-subagent
