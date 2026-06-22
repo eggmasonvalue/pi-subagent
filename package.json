@@ -1,6 +1,6 @@
 {
   "name": "@eggmasonvalue/pi-subagent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Observable, steerable, isolated-context subagents for pi — resume any child mid-task, flush partial results on interrupt/timeout, lean machine-facing envelope, optional model allowlist.",
   "keywords": [
     "pi-package",
