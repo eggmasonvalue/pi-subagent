@@ -1,0 +1,38 @@
+{
+  "name": "pi-subagent",
+  "version": "1.0.0",
+  "description": "Observable, isolated-context subagents for pi — abort-flush partials, first-class resume, lean machine-facing envelope, optional model allowlist.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagent",
+    "agents",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "author": "eggmasonvalue",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eggmasonvalue/pi-subagent.git"
+  },
+  "homepage": "https://github.com/eggmasonvalue/pi-subagent#readme",
+  "bugs": {
+    "url": "https://github.com/eggmasonvalue/pi-subagent/issues"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/subagent/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "files": [
+    "extensions",
+    "README.md"
+  ]
+}
