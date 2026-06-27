@@ -239,7 +239,6 @@ It supports either plain model ids (strings) or richer objects with an `id` plus
       "coding_index": 53.1,
       "description": "Great default for most coding tasks"
     },
-    "github-copilot/gpt-5.5"
   ],
   "default": "github-copilot/gpt-5.3-codex"
 }
