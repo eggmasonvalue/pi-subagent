@@ -2,11 +2,11 @@
 
 Delegate a task to a subagent that runs in its **own isolated context** (a separate `pi`
 process), then hand the result back to the main agent — while keeping the main agent's
-context window clean and **every child fully observable *and* steerable**.
+context window clean and **every child fully observable *and* steerable for agents and humans**.
 
 This is a deliberately *thin* primitive. The main agent is the intelligence; this tool
-just gives it a clean way to spawn isolated work, **read the receipts, and steer or resume
-any child** — including after an interrupt or timeout, without losing the work already done.
+just gives it a clean way to spawn isolated work, **read the receipts, and steer or resume any child**
+ — including after an interrupt or timeout, without losing the work already done.
 
 ---
 
@@ -56,7 +56,7 @@ Two features make that real rather than aspirational:
 
 ### Why no persona files
 
-The shipped pi example required every subagent to be a human-written `agent.md` persona.
+Popular subagents have every subagent as a human-written `agent.md` persona.
 We removed that as the default. A SOTA supervisor model knows how to frame a sub-task and
 adopt a persona far better than a static file written ahead of time. So by default this
 tool runs **inline**: the main agent supplies the task (and optionally a system prompt) at
@@ -125,7 +125,7 @@ propose a fix based on what it found.
 - `cwd` — working directory for the child process.
 - `agent` — name of a `*.md` agent file (optional; see below).
 - `label` — a correlation tag echoed back in the result envelope (e.g. the repo/feature a task maps to). Removes guesswork when fanning out.
-- `resume` — continue an existing child session instead of starting fresh (see **Resume**).
+- `resume` — exact JSONL path from a prior result's `session=` field (see **Resume**).
 - `timeoutMs` — kill the child after N ms and return its partial output with `status=timeout` (see **Timeouts**).
 
 ### Result envelope
@@ -134,7 +134,7 @@ Subagent output is consumed by the **main agent**, not a human, so each task's r
 prefixed with one terse machine-parsable line carrying only what the *tool* uniquely knows:
 
 ```
-[label=harden-repo-3 agent=inline status=done model=github-copilot/gpt-5.3-codex turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
+[label=harden-repo-3 agent=inline status=done model=github-copilot/gpt-5.3-codex thinking=low timeoutMs=120000 turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
 <the child's own final output, verbatim, byte-capped>
 ```
 
@@ -154,20 +154,21 @@ you at `subagent { resume }` for the unfinished ones.
 
 ### Resume
 
-Resume continues the **same** session (appends the next turn via `pi --session`), so the
-child keeps everything it already learned/built:
+Resume continues the **same** session file (appends the next turn via `pi --session`), so the
+child keeps its cache-compatible runtime configuration and prior context:
 
 ```
 subagent {
-  resume: "/…/sessions/subagent/<runId>/<id>.jsonl",   // path or partial id
+  resume: "/…/sessions/subagent/<runId>/<id>.jsonl",   // exact session= JSONL path
   task: "You looped on the import. The package is `foo`, not `foo-py`. Fix pyproject and re-run tests.",
   timeoutMs: 120000
 }
 ```
 
+- `resume` must be the exact JSONL path shown in a previous result's `session=` field, not a session id, label, run id, or basename.
 - `task` is **required** on a resume (it's the steering prompt) and is appended as the next user turn.
-- `resume` is **mutually exclusive** with `agent` / `systemPrompt` / `model` / `tools` — those are fixed by the original session. `thinking`, `cwd`, `timeoutMs`, and `label` still apply.
-- Typical loop: a child aborts/times out → `read` its `session` JSONL to diagnose → `subagent { resume, task: <correction> }`.
+- Only `timeoutMs` and `label` may vary on resume; `agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd` are fixed by the original session for provider prefix-cache compatibility.
+- Typical loop: a child aborts/times out → `read` its `session` JSONL to diagnose → `subagent { resume: <session-jsonl-path>, task: <correction> }`.
 - Works in single, parallel, and chain.
 
 ### Timeouts
@@ -189,9 +190,8 @@ fire-and-await is the default.
 subagent { listModels: true }
 ```
 
-Returns the allowlist (`allowed`), the resolved `default`, whether the policy is enabled,
-and the config path — so you can pick a capable child model *before* delegating instead of
-grepping the JSON. No subagent is spawned.
+Returns compact model-policy JSON: `columns` plus `models` rows, the resolved `default`,
+whether the policy is enabled, and the config path. No subagent is spawned.
 
 ### Note on progress
 
@@ -223,23 +223,22 @@ override the file's values.
 
 ### Model allowlist (optional, recommended)
 
-The allowlist is **user config, not shipped policy** — the extension reads it from your
-agent dir, *not* from the installed package. A copy lives in this repo as
-`extensions/subagent/models-allowlist.example.json`; to enable it, copy it into place:
+To hard-restrict which child models can be used, configure:
 
-```bash
-cp models-allowlist.example.json ~/.pi/agent/extensions/subagent/models-allowlist.json
-```
+`~/.pi/agent/extensions/subagent/models-allowlist.json`
 
-(or just create the file yourself at that path). Until it exists, the policy is simply
-disabled and children inherit the harness default model.
+It supports either plain model ids (strings) or richer objects with an `id` plus **any** metadata you may deem necessary for the main agent to make an informed decision about subagent choice:
 
 ```json
 {
   "enabled": true,
   "allowed": [
-    "github-copilot/gpt-5.3-codex",
-    "github-copilot/gpt-5.4",
+    {
+      "id": "github-copilot/gpt-5.3-codex",
+      "thinkingLevels": ["low", "medium", "high", "xhigh"],
+      "coding_index": 53.1,
+      "description": "Great default for most coding tasks"
+    },
     "github-copilot/gpt-5.5"
   ],
   "default": "github-copilot/gpt-5.3-codex"
@@ -249,10 +248,10 @@ disabled and children inherit the harness default model.
 Behavior when enabled:
 
 - Effective model resolution is: inline `model` → named-agent `model` → allowlist `default`.
-- The resolved model must be an **exact string match** in `allowed`.
+- The resolved model must match an allowed `id` exactly.
 - If no model resolves and no `default` is set, the call fails early.
 - If the file is missing, policy is disabled (legacy behavior).
-- Run `subagent { listModels: true }` to see the resolved default + allowed set at any time.
+- `subagent { listModels: true }` returns compact policy JSON as `{ columns, models, default, allowlistEnabled, configPath }`.
 
 **Security:** project-local agents are repo-controlled prompts. By default only user-level
 agents load. Enable project agents with `agentScope: "both"` (or `"project"`), and the tool
@@ -274,7 +273,7 @@ will prompt for confirmation before running them interactively
 
 ## Debugging a subagent run
 
-When a child's summary looks off, you don't guess — you read the receipts:
+When a child's summary looks off, let you or the agent read the receipts:
 
 ```bash
 # the session path is shown live in the tool row as soon as the child starts,
@@ -306,7 +305,8 @@ pi-subagent/
     └── subagent/
         ├── index.ts                      # the extension (tool registration, spawning, rendering)
         ├── agents.ts                     # optional named-agent discovery
-        └── models-allowlist.example.json # copy to ~/.pi/agent/extensions/subagent/ to enable
+        ├── models-allowlist.json         # model policy (optional)
+        └── enrich.ts                     # one-time helper to enrich allowlist metadata (optional-to be used with eggmasonvalue/pi-setup repo's enrich-models.md prompt file)
 ```
 
 ## Reload
