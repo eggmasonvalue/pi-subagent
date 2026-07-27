@@ -183,8 +183,14 @@ interface ResolvedSpec {
 	systemPrompt: string;
 }
 
+interface ModelAllowlistLevel {
+	artificialAnalysis?: { intelligence?: number; coding?: number; cost?: number };
+	deepSWE?: { pass?: number; cost?: number };
+}
+
 interface ModelAllowlistEntry {
 	id: string;
+	levels?: Record<string, ModelAllowlistLevel>;
 	[key: string]: unknown;
 }
 
@@ -285,39 +291,79 @@ function loadModelPolicy(): { policy: ModelPolicy; error?: string } {
 	};
 }
 
-function compactModelValue(value: unknown): unknown {
-	return Array.isArray(value) ? value.join("|") : value;
-}
-
 function compactModelList(policy: ModelPolicy): { columns: string[]; models: unknown[][] } {
-	const columns: string[] = [];
-	const addColumn = (key: string) => {
-		if (!columns.includes(key)) columns.push(key);
-	};
-
+	const columns = ["id", "levels", "description"];
 	const entries = Array.from(policy.allowed).map((id) => policy.metadata.get(id) ?? { id });
-	for (const entry of entries) {
-		for (const key of Object.keys(entry)) addColumn(key);
-	}
+	const formatLevels = (levels: unknown): string => {
+		if (!levels || typeof levels !== "object" || Array.isArray(levels)) return "";
+		return Object.entries(levels as Record<string, ModelAllowlistLevel>)
+			.map(([level, value]) => {
+				const parts: string[] = [];
+				const aa = value?.artificialAnalysis;
+				if (aa) {
+					const quality = [aa.intelligence, aa.coding]
+						.filter((metric): metric is number => typeof metric === "number")
+						.map((metric) => metric.toFixed(1))
+						.join("/");
+					parts.push(`AA ${quality || "?"}${typeof aa.cost === "number" ? `/$${aa.cost}` : ""}`);
+				}
+				const deepSWE = value?.deepSWE;
+				if (deepSWE) {
+					const pass = typeof deepSWE.pass === "number" ? `${Math.round(deepSWE.pass * 100)}%` : "?";
+					parts.push(`DeepSWE ${pass}${typeof deepSWE.cost === "number" ? `/$${deepSWE.cost}` : ""}`);
+				}
+				return `${level}: ${parts.join(" · ") || "unbenchmarked"}`;
+			})
+			.join(" · ");
+	};
 
 	return {
 		columns,
-		models: entries.map((entry) => columns.map((key) => compactModelValue(entry[key] ?? null))),
+		models: entries.map((entry) => [entry.id, formatLevels(entry.levels), entry.description ?? null]),
 	};
 }
 
 /**
- * Reads a model allowlist entry's `thinkingLevels` metadata as a validated
- * string array, or undefined if absent/malformed. Presence of this array on
- * an entry turns it from descriptive metadata into an enforced per-model
- * thinking-level allowlist — curators drop the risky level (e.g. `xhigh`,
- * prone to overthinking/scope creep on some models) from the array to block
- * it. Omit the key entirely to leave thinking unrestricted for that model.
+ * The keys under `levels` are the per-model thinking levels permitted by policy.
  */
 function getAllowedThinkingLevels(entry: ModelAllowlistEntry | undefined): string[] | undefined {
-	const levels = entry?.thinkingLevels;
-	if (!Array.isArray(levels) || levels.length === 0) return undefined;
-	return levels.every((l): l is string => typeof l === "string") ? levels : undefined;
+	const levels = entry?.levels;
+	if (!levels || typeof levels !== "object" || Array.isArray(levels)) return undefined;
+	const names = Object.keys(levels);
+	return names.length > 0 ? names : undefined;
+}
+
+function validateModelPolicy(policy: ModelPolicy, registry: { getAll(): any[] }): string[] {
+	if (!policy.enabled) return [];
+	const errors: string[] = [];
+	const models = new Map<string, any>();
+	for (const model of registry.getAll()) models.set(`${model.provider}/${model.id}`, model);
+
+	for (const id of policy.allowed) {
+		const entry = policy.metadata.get(id);
+		const model = models.get(id);
+		if (!model) {
+			errors.push(`Allowlisted model "${id}" is not known to pi.`);
+			continue;
+		}
+		for (const level of getAllowedThinkingLevels(entry) ?? []) {
+			if (level === "off") continue;
+			if (!model.reasoning) {
+				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
+				continue;
+			}
+			const map = model.thinkingLevelMap as Record<string, unknown> | undefined;
+			if ((level === "xhigh" || level === "max") && (!map || !(level in map) || map[level] === null)) {
+				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
+			} else if (map && level in map && map[level] === null) {
+				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
+			}
+		}
+	}
+	if (policy.defaultModel && !policy.allowed.has(policy.defaultModel)) {
+		errors.push(`Default model "${policy.defaultModel}" is not in the allowlist.`);
+	}
+	return errors;
 }
 
 function enforceModelPolicy(spec: ResolvedSpec, policy: ModelPolicy): { spec?: ResolvedSpec; error?: string } {
@@ -933,7 +979,7 @@ const DESC = {
 	model:
 		"Model for the subagent, e.g. 'sonnet' or 'provider/id'. Subject to the model allowlist if enabled (see `listModels`). Must be omitted when `resume` is set — the model is fixed by the resumed session.",
 	thinking:
-		"Thinking level for the subagent model (see `thinkingLevels` in `listModels` output for valid values per model; enforced when the allowlist is enabled).",
+		"Thinking level for the subagent model (see `levels` in `listModels` output for valid values per model; enforced when the allowlist is enabled).",
 	tools: "Tool allowlist, e.g. ['read','grep','bash']. Omit to use the harness's default toolset.",
 	cwd: "Working directory for the agent process. Defaults to the current session's cwd.",
 	resume:
@@ -1014,11 +1060,14 @@ export default function (pi: ExtensionAPI) {
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 			const { policy: modelPolicy, error: modelPolicyError } = loadModelPolicy();
+			const validationErrors = modelPolicyError ? [] : validateModelPolicy(modelPolicy, ctx.modelRegistry);
 
 			if (params.listModels) {
 				const compactModels = compactModelList(modelPolicy);
 				const payload = {
 					allowlistEnabled: modelPolicy.enabled,
+					validationErrors,
+					levelsLegend: "Benchmark summary by allowed thinking level: AA <intelligence>/<coding>/$<cost>; DeepSWE <pass@1>/$<cost>.",
 					default: modelPolicy.defaultModel ?? null,
 					...compactModels,
 					configPath: modelPolicy.configPath,
@@ -1051,9 +1100,10 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			if (modelPolicyError) {
+			if (modelPolicyError || validationErrors.length > 0) {
+				const errorText = [modelPolicyError, ...validationErrors].filter(Boolean).join("\n");
 				return {
-					content: [{ type: "text", text: modelPolicyError }],
+					content: [{ type: "text", text: errorText }],
 					details: makeDetails("single")([]),
 					isError: true,
 				};

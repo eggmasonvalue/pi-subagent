@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 .pi/
+
+# Local subagent policy (keep the example tracked)
+extensions/subagent/models-allowlist.json
