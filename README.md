@@ -167,7 +167,7 @@ subagent {
 
 - `resume` must be the exact JSONL path shown in a previous result's `session=` field, not a session id, label, run id, or basename.
 - `task` is **required** on a resume (it's the steering prompt) and is appended as the next user turn.
-- Only `timeoutMs` and `label` may vary on resume; `agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd` are fixed by the original session for provider prefix-cache compatibility.
+- Runtime fields (`agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd`) are ignored on resume; the original session owns them for provider prefix-cache compatibility. Only `timeoutMs` and `label` affect the resumed invocation.
 - Typical loop: a child aborts/times out → `read` its `session` JSONL to diagnose → `subagent { resume: <session-jsonl-path>, task: <correction> }`.
 - Works in single, parallel, and chain.
 

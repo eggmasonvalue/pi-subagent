@@ -369,7 +369,7 @@ function validateModelPolicy(policy: ModelPolicy, registry: { getAll(): any[] })
 function enforceModelPolicy(spec: ResolvedSpec, policy: ModelPolicy): { spec?: ResolvedSpec; error?: string } {
 	if (!policy.enabled) return { spec };
 
-	const model = spec.model ?? policy.defaultModel;
+	const model = spec.model?.trim() || policy.defaultModel;
 	if (!model) {
 		return {
 			error: `Model is required by allowlist policy. Provide \"model\" or set \"default\" in ${policy.configPath}.`,
@@ -479,20 +479,8 @@ function resolveRunPlan(
 		label: item.label,
 	};
 	if (opts.resume) {
-		if (
-			item.agent ||
-			item.systemPrompt ||
-			item.model ||
-			item.thinking ||
-			item.cwd ||
-			(item.tools && item.tools.length > 0)
-		) {
-			return {
-				opts,
-				error:
-					"resume only accepts resume/task/timeoutMs/label; runtime config is fixed by the child session for cache-compatible continuation.",
-			};
-		}
+		// Resume owns all runtime configuration. Ignore any wrapper-injected fresh-run
+		// fields rather than rejecting an otherwise valid continuation request.
 		if (!item.task || !item.task.trim()) {
 			return { opts, error: "resume requires a continuation `task` (the steering prompt for the resumed session)." };
 		}
@@ -589,6 +577,13 @@ function isFailedResult(result: SingleResult): boolean {
 }
 
 /** Single-word status for the model-facing envelope. */
+function resolveReportedModelId(model: string, provider: string | undefined, policy: ModelPolicy): string | undefined {
+	if (policy.allowed.has(model)) return model;
+	if (provider && policy.allowed.has(`${provider}/${model}`)) return `${provider}/${model}`;
+	const matches = Array.from(policy.allowed).filter((id) => id.endsWith(`/${model}`));
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
 function statusOf(result: SingleResult): string {
 	switch (result.stopReason) {
 		case "never-started":
@@ -854,7 +849,7 @@ async function runSingleAgent(
 				wasPolicyBlocked = true;
 				const allowedPreview = Array.from(policy?.allowed ?? []).slice(0, 8).join(", ") || "(none)";
 				const extra = policy && policy.allowed.size > 8 ? ` (+${policy.allowed.size - 8} more)` : "";
-				currentResult.errorMessage = `Model "${model}" is not in allowlist (${policy?.configPath}). Allowed: ${allowedPreview}${extra}. Killed resumed session to enforce policy — resume again with an allowed model is not possible (model is fixed by the session); start a fresh run instead.`;
+				currentResult.errorMessage = `Model "${model}" is not in allowlist (${policy?.configPath}). Allowed: ${allowedPreview}${extra}. Killed child to enforce policy.`;
 				proc.kill("SIGTERM");
 				setTimeout(() => {
 					if (!proc.killed) proc.kill("SIGKILL");
@@ -894,8 +889,15 @@ async function runSingleAgent(
 							currentResult.usage.cost += usage.cost?.total || 0;
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (policy?.enabled && msg.model && !policy.allowed.has(msg.model)) blockForPolicy(msg.model);
+						const reportedModel = msg.model as string | undefined;
+						const reportedProvider = (msg as any).provider as string | undefined;
+						if (reportedModel) {
+							const canonicalModel = policy?.enabled
+								? resolveReportedModelId(reportedModel, reportedProvider, policy)
+								: undefined;
+							if (!currentResult.model) currentResult.model = canonicalModel ?? reportedModel;
+							if (policy?.enabled && !canonicalModel) blockForPolicy(reportedModel);
+						}
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
@@ -971,19 +973,18 @@ async function runSingleAgent(
 // (`stopReason=timeout`, which is never actually in the model-facing envelope
 // — the envelope key is `status=`) survive identically in three places.
 const DESC = {
-	task: "Task to delegate to the subagent. When `resume` is set, this is the steering/correction prompt appended to the resumed session instead of a fresh task.",
+	task: "Task for the child. With `resume`, this becomes the steering prompt for the saved session.",
 	label: "Correlation label echoed in the result envelope (e.g. repo/feature name).",
 	agent: "Optional named agent. If omitted, runs inline.",
 	systemPrompt:
 		"Inline system prompt, appended to the child's base prompt. Ignored if `agent` is set (the named agent's own prompt is used instead).",
 	model:
-		"Model for the subagent, e.g. 'sonnet' or 'provider/id'. Subject to the model allowlist if enabled (see `listModels`). Must be omitted when `resume` is set — the model is fixed by the resumed session.",
-	thinking:
-		"Thinking level for the subagent model (see `levels` in `listModels` output for valid values per model; enforced when the allowlist is enabled).",
+		"Exact model id for a fresh run. If the allowlist is enabled, use an id returned by `listModels`; aliases and provider-less names may be rejected. Omit to use the configured default.",
+	thinking: "Thinking level for a fresh run. Must be permitted for the selected model when the allowlist is enabled.",
 	tools: "Tool allowlist, e.g. ['read','grep','bash']. Omit to use the harness's default toolset.",
 	cwd: "Working directory for the agent process. Defaults to the current session's cwd.",
 	resume:
-		"Exact child session JSONL path from a previous result's `session=` field. The `task` you provide is appended as the next steering turn. Only `timeoutMs`/`label` may vary — other params are fixed by the session and error if passed alongside `resume`.",
+		"Exact session JSONL path from a previous result's `session` field. The task is appended as a steering prompt. Fresh-run options are ignored; the saved session supplies its runtime configuration.",
 	timeoutMs: "Kill the child after this many ms and return partial output (status=timeout). No default.",
 } as const;
 
@@ -1033,7 +1034,7 @@ const SubagentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of tasks for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of steps for sequential execution" })),
 	listModels: Type.Optional(
-		Type.Boolean({ description: "Return the model allowlist + resolved default and exit (no subagent is spawned)." }),
+		Type.Boolean({ description: "Show exact allowed model ids, thinking levels, benchmark summaries, default, and validation errors. No subagent is spawned." }),
 	),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
@@ -1048,9 +1049,9 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate work to an isolated child pi process.",
-			"Modes: single (`task`), parallel (`tasks[]`), chain (`chain[]` with `{previous}`).",
-			"Resume with exact `session=` JSONL path; tune with model/thinking/tools/timeoutMs on fresh runs.",
-			"Results include status/model/thinking/label/session; use `{listModels:true}` for model policy.",
+			"Use `task` for one run, `tasks` for parallel runs, or `chain` for sequential runs.",
+			"Use `resume` with a previous session path to continue existing work.",
+			"Use `listModels: true` to discover exact allowed model ids and thinking levels.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -1189,7 +1190,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						spec,
 						taskWithContext,
-						step.cwd,
+						opts.resume ? undefined : step.cwd,
 						i + 1,
 						signal,
 						chainUpdate,
@@ -1279,7 +1280,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						spec,
 						t.task,
-						t.cwd,
+						opts.resume ? undefined : t.cwd,
 						undefined,
 						signal,
 						// Per-task update callback
@@ -1328,7 +1329,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.cwd,
 					spec,
 					params.task,
-					params.cwd,
+					params.resume ? undefined : params.cwd,
 					undefined,
 					signal,
 					onUpdate,
