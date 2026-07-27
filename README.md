@@ -31,6 +31,10 @@ step.
 > code. Review the source before installing. This one spawns child `pi` processes and
 > reads/writes session JSONL under `~/.pi/agent/sessions/subagent/`.
 
+> **Prompt-cache note:** `subagent` is loaded lazily. Cache prefixes are preserved only
+> on models with native deferred-tool support; other models may incur one cache miss when
+> the tool is activated.
+
 ---
 
 ## What this is solving for
