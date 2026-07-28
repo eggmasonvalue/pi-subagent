@@ -167,7 +167,7 @@ subagent {
 
 - `resume` must be the exact JSONL path shown in a previous result's `session=` field, not a session id, label, run id, or basename.
 - `task` is **required** on a resume (it's the steering prompt) and is appended as the next user turn.
-- Only `timeoutMs` and `label` may vary on resume; `agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd` are fixed by the original session for provider prefix-cache compatibility.
+- Runtime fields (`agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd`) are ignored on resume; the original session owns them for provider prefix-cache compatibility. Only `timeoutMs` and `label` affect the resumed invocation.
 - Typical loop: a child aborts/times out → `read` its `session` JSONL to diagnose → `subagent { resume: <session-jsonl-path>, task: <correction> }`.
 - Works in single, parallel, and chain.
 
@@ -223,11 +223,49 @@ override the file's values.
 
 ### Model allowlist (optional, recommended)
 
-To hard-restrict which child models can be used, configure:
+To hard-restrict which child models can be used, copy
+`extensions/subagent/models-allowlist.example.json` to:
 
 `~/.pi/agent/extensions/subagent/models-allowlist.json`
 
-It supports either plain model ids (strings) or richer objects with an `id` plus **any** metadata you may deem necessary for the main agent to make an informed decision about subagent choice:
+Then edit the copied file with the model IDs and thinking levels you want to allow.
+
+A populated entry looks like this after benchmark data has been refreshed:
+
+```json
+{
+  "id": "github-copilot/gpt-5.5",
+  "levels": {
+    "high": {
+      "artificialAnalysis": {
+        "intelligence": 55.1,
+        "coding": 70.8,
+        "cost": 4.63
+      },
+      "deepSWE": {
+        "pass": 0.619,
+        "cost": 4.47
+      }
+    },
+    "xhigh": {
+      "artificialAnalysis": {
+        "intelligence": 57.2,
+        "coding": 74.1,
+        "cost": 6.61
+      },
+      "deepSWE": {
+        "pass": 0.700,
+        "cost": 6.61
+      }
+    }
+  },
+  "description": "Strong coding model"
+}
+```
+
+Artificial Analysis provides composite intelligence, coding, and cost metrics. DeepSWE provides coding-agent pass rate and cost. Either source is optional; an empty source or level means no matching data has been imported yet. Benchmark values are advisory; pi model metadata remains authoritative for capability validation.
+
+It supports either plain model ids (strings) or richer objects with an `id`, optional `levels`, and an optional human-readable `description`. Benchmark values under `levels` are formatted into the compact model-facing output described by `levelsLegend`. Unknown extra fields are preserved in the JSON but are not included in the compact `listModels` response:
 
 ```json
 {
@@ -235,8 +273,12 @@ It supports either plain model ids (strings) or richer objects with an `id` plus
   "allowed": [
     {
       "id": "github-copilot/gpt-5.3-codex",
-      "thinkingLevels": ["low", "medium", "high", "xhigh"],
-      "coding_index": 53.1,
+      "levels": {
+        "low": {},
+        "medium": {},
+        "high": {},
+        "xhigh": {}
+      },
       "description": "Great default for most coding tasks"
     },
   ],
@@ -248,7 +290,7 @@ Behavior when enabled:
 
 - Effective model resolution is: inline `model` → named-agent `model` → allowlist `default`.
 - The resolved model must match an allowed `id` exactly.
-- **`thinkingLevels` is enforced, not just descriptive.** If an allowed entry includes a `thinkingLevels` array, the resolved `thinking` value must be one of them or the call fails (fresh runs only — `thinking` can't be passed on `resume` at all). Drop a level from the array (e.g. remove `"xhigh"`) to block it for that model — useful for a model/level combo prone to overthinking or scope creep. Omit the `thinkingLevels` key on an entry entirely to leave thinking unrestricted for that model.
+- **`levels` is enforced, not just descriptive.** If an allowed entry includes a `levels` object, the resolved `thinking` value must be one of its keys or the call fails (fresh runs only — `thinking` can't be passed on `resume` at all). Remove a level key (e.g. remove `"xhigh"`) to block it for that model. Omit the `levels` key on an entry entirely to leave thinking unrestricted for that model.
 - If no model resolves and no `default` is set, the call fails early.
 - If the file is missing, policy is disabled (legacy behavior).
 - `subagent { listModels: true }` returns compact policy JSON as `{ columns, models, default, allowlistEnabled, configPath }`.
@@ -258,6 +300,19 @@ Behavior when enabled:
 agents load. Enable project agents with `agentScope: "both"` (or `"project"`), and the tool
 will prompt for confirmation before running them interactively
 (`confirmProjectAgents: false` to disable).
+
+### Refreshing benchmark data
+
+The allowlist is edited directly in `models-allowlist.json`. To refresh the optional
+per-level data for configured entries, run from the package checkout:
+
+```bash
+bun extensions/subagent/refresh-aa-benchmarks.ts
+bun extensions/subagent/refresh-deepswe-benchmarks.ts
+```
+
+Missing benchmark pages or rows are reported as warnings and do not remove configured
+models or thinking levels. Benchmark data is advisory; runtime validation uses pi's model metadata.
 
 ---
 
@@ -306,8 +361,9 @@ pi-subagent/
     └── subagent/
         ├── index.ts                      # the extension (tool registration, spawning, rendering)
         ├── agents.ts                     # optional named-agent discovery
-        ├── models-allowlist.json         # model policy (optional)
-        └── enrich.ts                     # one-time helper to enrich allowlist metadata (optional-to be used with eggmasonvalue/pi-setup repo's enrich-models.md prompt file)
+        ├── models-allowlist.example.json # policy template
+        ├── refresh-aa-benchmarks.ts     # refreshes per-level Artificial Analysis data
+        └── refresh-deepswe-benchmarks.ts # refreshes per-level DeepSWE data
 ```
 
 ## Reload
