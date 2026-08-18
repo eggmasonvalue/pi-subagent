@@ -774,7 +774,12 @@ async function runSingleAgent(
 	else args.push("--session-dir", sessionDir);
 	if (!resumePath && spec.model) args.push("--model", spec.model);
 	if (!resumePath && spec.thinking) args.push("--thinking", spec.thinking);
-	if (!resumePath && spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
+	if (!resumePath && spec.tools !== undefined) {
+		// Omission inherits Pi's defaults, while an explicit empty list disables
+		// every tool. Keeping those cases distinct avoids silently widening access.
+		if (spec.tools.length === 0) args.push("--no-tools");
+		else args.push("--tools", spec.tools.join(","));
+	}
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -983,7 +988,8 @@ const DESC = {
 	model:
 		"Exact model id for a fresh run. If the allowlist is enabled, use an id returned by `listModels`; aliases and provider-less names may be rejected. Omit to use the configured default.",
 	thinking: "Thinking level for a fresh run. Must be permitted for the selected model when the allowlist is enabled.",
-	tools: "Tool allowlist, e.g. ['read','grep','bash']. Omit to use the harness's default toolset.",
+	tools:
+		"Tool allowlist, e.g. ['read','grep','bash']. Pass an empty array to disable all tools. Omit to use the harness's default toolset.",
 	cwd: "Working directory for the agent process. Defaults to the current session's cwd.",
 	resume:
 		"Exact session JSONL path from a previous result's `session` field. The task is appended as a steering prompt. Fresh-run options are ignored; the saved session supplies its runtime configuration.",

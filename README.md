@@ -122,6 +122,7 @@ propose a fix based on what it found.
 - `model` — e.g. `sonnet`, `provider/id`.
 - `thinking` — optional passthrough to child `--thinking` (no hardcoded validation in this extension).
 - `tools` — allowlist, e.g. `["read", "grep", "find", "ls"]` for a read-only scout.
+  Pass `[]` to disable all tools. Omit it to use pi's default tools.
 - `cwd` — working directory for the child process.
 - `agent` — name of a `*.md` agent file (optional; see below).
 - `label` — a correlation tag echoed back in the result envelope (e.g. the repo/feature a task maps to). Removes guesswork when fanning out.
