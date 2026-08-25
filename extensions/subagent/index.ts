@@ -82,6 +82,7 @@ interface ModelAllowlistConfig {
 	enabled?: boolean;
 	allowed?: (string | ModelAllowlistEntry)[];
 	default?: string;
+	defaultThinking?: string;
 }
 
 interface ModelPolicy {
@@ -89,6 +90,7 @@ interface ModelPolicy {
 	allowed: Set<string>;
 	metadata: Map<string, ModelAllowlistEntry>;
 	defaultModel?: string;
+	defaultThinking?: string;
 	configPath: string;
 }
 
@@ -145,6 +147,13 @@ function loadModelPolicy(configPath = getModelAllowlistPath()): { policy: ModelP
 	if (config.default !== undefined && typeof config.default !== "string") {
 		return { policy: disabled, error: 'Model allowlist field "default" must be a string.' };
 	}
+	if (config.defaultThinking !== undefined && typeof config.defaultThinking !== "string") {
+		return { policy: disabled, error: 'Model allowlist field "defaultThinking" must be a string.' };
+	}
+	const defaultThinking = config.defaultThinking?.trim() || undefined;
+	if (defaultThinking && !THINKING_LEVEL_SET.has(defaultThinking)) {
+		return { policy: disabled, error: `Default thinking level "${defaultThinking}" is not recognized by Pi.` };
+	}
 
 	const metadata = new Map<string, ModelAllowlistEntry>();
 	const allowed = new Set<string>();
@@ -170,7 +179,7 @@ function loadModelPolicy(configPath = getModelAllowlistPath()): { policy: ModelP
 		return { policy: disabled, error: 'The default model must also appear in "allowed".' };
 	}
 
-	return { policy: { enabled, allowed, metadata, defaultModel, configPath } };
+	return { policy: { enabled, allowed, metadata, defaultModel, defaultThinking, configPath } };
 }
 
 function allowedThinkingLevels(entry: ModelAllowlistEntry | undefined): string[] | undefined {
@@ -215,6 +224,12 @@ function validateModelPolicy(policy: ModelPolicy, registry: ModelRegistryView): 
 			}
 		}
 	}
+	if (policy.defaultThinking && policy.defaultModel) {
+		const defaultModel = known.get(policy.defaultModel);
+		if (defaultModel && !effectiveThinkingLevels(policy.metadata.get(policy.defaultModel), defaultModel).includes(policy.defaultThinking as ThinkingLevel)) {
+			errors.push(`Default thinking level "${policy.defaultThinking}" is not allowed for "${policy.defaultModel}".`);
+		}
+	}
 	return errors;
 }
 
@@ -223,7 +238,7 @@ function resolveFreshModel(
 	thinking: string | undefined,
 	policy: ModelPolicy,
 	registry?: ModelRegistryView,
-): { model?: string; error?: string } {
+): { model?: string; thinking?: string; error?: string } {
 	if (!policy.enabled) return { model: requestedModel?.trim() || undefined };
 	const model = requestedModel?.trim() || policy.defaultModel;
 	if (!model) return { error: "Model policy requires `model`, but no default is configured." };
@@ -234,13 +249,14 @@ function resolveFreshModel(
 	const configuredLevels = allowedThinkingLevels(entry);
 	const knownModel = registry ? modelMap(registry).get(model) : undefined;
 	const levels = knownModel ? effectiveThinkingLevels(entry, knownModel) : configuredLevels;
-	if (!thinking && configuredLevels) {
+	const selectedThinking = thinking || policy.defaultThinking;
+	if (!selectedThinking && configuredLevels) {
 		return { error: `Thinking level is required for "${model}". Allowed: ${levels?.join(", ") || "none"}.` };
 	}
-	if (thinking && levels && !levels.includes(thinking)) {
-		return { error: `Thinking level "${thinking}" is not allowed for "${model}". Allowed: ${levels.join(", ") || "none"}.` };
+	if (selectedThinking && levels && !levels.includes(selectedThinking)) {
+		return { error: `Thinking level "${selectedThinking}" is not allowed for "${model}". Allowed: ${levels.join(", ") || "none"}.` };
 	}
-	return { model };
+	return selectedThinking && !thinking ? { model, thinking: selectedThinking } : { model };
 }
 
 function formatLevels(levels: ThinkingLevel[], metadata: unknown): string {
@@ -274,6 +290,7 @@ function compactModelCatalog(policy: ModelPolicy, validationErrors: string[], re
 	return {
 		allowlistEnabled: policy.enabled,
 		default: policy.defaultModel ?? null,
+		defaultThinking: policy.defaultThinking ?? null,
 		columns: ["id", "levels", "description"],
 		models: entries.map((entry) => {
 			const model = known.get(entry.id);
@@ -282,7 +299,7 @@ function compactModelCatalog(policy: ModelPolicy, validationErrors: string[], re
 		}),
 		validationErrors,
 		note: policy.enabled
-			? "Use a row id as subagent.model and one of its levels as subagent.thinking. Omit model to use the default."
+			? "Use a row id as subagent.model and one of its levels as subagent.thinking. Omit model to use the default; omit thinking to use defaultThinking when configured."
 			: "No allowlist is configured; omit subagent.model to use the child Pi default or provide any available Pi model.",
 	};
 }
@@ -827,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 				config = {
 					cwd: path.resolve(params.cwd ?? ctx.cwd),
 					model: selected.model,
-					thinking: params.thinking,
+					thinking: selected.thinking ?? params.thinking,
 					tools: params.tools ? [...new Set(params.tools)] : inheritedTools,
 				};
 			}

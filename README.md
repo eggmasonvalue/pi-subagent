@@ -223,7 +223,7 @@ The zero-argument `subagent_models` tool returns the curated catalog on demand. 
 - permitted thinking levels;
 - optional benchmark data for each level;
 - optional user-written descriptions;
-- the configured default.
+- the configured model and thinking defaults.
 
 The parent should normally call it once when model choice matters and reuse that result for later delegations. The catalog is not injected into every system prompt.
 
@@ -253,6 +253,7 @@ A model entry may be a plain ID or an object with per-level metadata:
 {
   "enabled": true,
   "default": "github-copilot/gpt-5.3-codex",
+  "defaultThinking": "high",
   "allowed": [
     {
       "id": "github-copilot/gpt-5.3-codex",
@@ -276,7 +277,7 @@ A model entry may be a plain ID or an object with per-level metadata:
 }
 ```
 
-When a non-empty `levels` object is present, `thinking` is required and its value must match one of the keys. Pi's model metadata narrows those configured keys to levels the model actually supports. Omitting `levels` permits the model's full Pi-supported set and allows the child Pi default when `thinking` is omitted.
+When a non-empty `levels` object is present, `thinking` must match one of the keys. Pi's model metadata narrows those configured keys to levels the model actually supports. Omitting `levels` permits the model's full Pi-supported set. `defaultThinking` supplies the thinking level for fresh children when `subagent.thinking` is omitted; an explicit tool argument takes precedence. If neither is set, the child Pi default is used when the selected model has no configured levels.
 
 If the allowlist file is absent, model policy is disabled and the child may use Pi's normal model configuration.
 

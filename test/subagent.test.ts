@@ -254,6 +254,40 @@ test("model policy loads a curated catalog and rejects unknown thinking levels",
   assert.match(validation.join("\n"), /not recognized by Pi/);
 });
 
+test("model policy applies a configured default thinking level", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-default-thinking-test-"));
+  const configPath = path.join(directory, "models-allowlist.json");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.writeFileSync(configPath, JSON.stringify({
+    enabled: true,
+    default: "provider/model",
+    defaultThinking: "high",
+    allowed: [{ id: "provider/model" }],
+  }));
+
+  const { policy, error } = __testing.loadModelPolicy(configPath);
+  assert.equal(error, undefined);
+  const registry = {
+    getAll: () => [{ provider: "provider", id: "model", reasoning: true, thinkingLevelMap: {} }],
+  } as any;
+  assert.equal(policy.defaultThinking, "high");
+  assert.deepEqual(__testing.resolveFreshModel(undefined, undefined, policy, registry), {
+    model: "provider/model",
+    thinking: "high",
+  });
+  assert.deepEqual(__testing.resolveFreshModel(undefined, "medium", policy, registry), { model: "provider/model" });
+  assert.equal(__testing.compactModelCatalog(policy, [], registry).defaultThinking, "high");
+});
+
+test("model policy rejects an unrecognized default thinking level", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-invalid-default-thinking-test-"));
+  const configPath = path.join(directory, "models-allowlist.json");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.writeFileSync(configPath, JSON.stringify({ enabled: true, defaultThinking: "invalid", allowed: ["provider/model"] }));
+  const { error } = __testing.loadModelPolicy(configPath);
+  assert.match(error!, /not recognized by Pi/);
+});
+
 test("model policy enforces exact models and the Pi-supported thinking subset", () => {
   const policy = {
     enabled: true,
