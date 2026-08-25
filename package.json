@@ -1,7 +1,8 @@
 {
   "name": "@eggmasonvalue/pi-subagent",
-  "version": "1.2.0",
-  "description": "Observable, steerable, isolated-context subagents for pi — resume any child mid-task, flush partial results on interrupt/timeout, lean machine-facing envelope, optional model allowlist.",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Thin, observable, resumable isolated-context subagents for pi.",
   "keywords": [
     "pi-package",
     "pi",
@@ -17,6 +18,10 @@
   ],
   "license": "MIT",
   "author": "eggmasonvalue",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/eggmasonvalue/pi-subagent.git"
@@ -36,6 +41,10 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
   },
   "files": [
     "extensions",

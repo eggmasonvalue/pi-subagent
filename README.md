@@ -1,371 +1,404 @@
-# Subagent
+# Pi Subagent
 
-Delegate a task to a subagent that runs in its **own isolated context** (a separate `pi`
-process), then hand the result back to the main agent — while keeping the main agent's
-context window clean and **every child fully observable *and* steerable for agents and humans**.
+A small, high-leverage subagent extension for [pi](https://pi.dev).
 
-This is a deliberately *thin* primitive. The main agent is the intelligence; this tool
-just gives it a clean way to spawn isolated work, **read the receipts, and steer or resume any child**
- — including after an interrupt or timeout, without losing the work already done.
+Each `subagent` call starts a focused child Pi process with its own context window. The parent waits for a final or partial result while the human sees live progress. Every child session is persisted, so the parent can inspect it, resume it with new direction, or recover useful work after an interrupt or timeout.
 
----
+## Design principles
+
+This package is not trying to be the most feature-rich subagent framework. It assumes modern models are capable supervisors and gives the parent agent a small set of powerful mechanisms instead of prescribing an orchestration system.
+
+The design follows four priorities:
+
+- keep both parent and child contexts as clean as possible, but no cleaner than the task permits;
+- leave task framing, model choice, capability selection, and follow-up decisions to the parent model whenever it has enough information;
+- preserve the essential observability and steerability needed by both the model and the human;
+- prefer a few composable primitives over specialized workflows and lifecycle machinery.
+
+The result is intentionally thin rather than universally comprehensive. It is designed for users who want the model to orchestrate, Pi to provide the underlying runtime capabilities, and the extension to stay out of the way.
+
+The control model is deliberately simple:
+
+```text
+delegate → observe → return or timeout → resume with direction
+```
+
+That small loop covers completion, clarification, supervision, recovery, and iterative work without a background-job system or a separate messaging protocol.
+
+## Small surface, broad capability
+
+Thin does not mean limited. Most useful subagent behavior falls out of a few composable mechanisms:
+
+| Need | Mechanism |
+|---|---|
+| Focused work without consuming the parent's context | A fresh child Pi process |
+| Independent investigations | Multiple sibling calls, executed concurrently by Pi |
+| Clarification | The child returns its question; the parent resumes with an answer |
+| Progress review | A task-specific timeout returns control to the parent |
+| Correction or follow-up | Resume the same persisted child session |
+| Interrupt recovery | Abort flushes partial output and preserves the session |
+| Human observability | Live TUI updates plus a durable session receipt |
+| Model and cost control | Per-task model, thinking, and tool selection within user policy |
+
+Together these cover the common delegation lifecycle without requiring background jobs, polling, mailboxes, workflow graphs, or a custom scheduler. The extension stays small while the parent model composes the primitives according to the task.
+
+### Clean context boundaries
+
+The child receives a self-contained task in a fresh Pi context. Its intermediate tool traffic stays out of the parent model's context; only its concise result returns to the parent.
+
+### Return is the event
+
+A child does not need a mailbox or lifecycle protocol. It returns when it finishes or when it needs clarification, a decision, or missing information. The parent answers by resuming the same session.
+
+### Timeout is a supervision point
+
+`timeoutMs` is not merely a hang guard. It defines when the parent should regain control and review progress. If the child is still working, its partial result and session path are preserved. The parent can then resume it for a status summary or with revised direction.
+
+### Resume is steering
+
+A resumed child keeps the context it accumulated previously. Corrections, answers, and follow-up work become the next user turn in that same session instead of forcing another child to rediscover the task.
+
+### Pi provides parallelism
+
+For independent work, the parent emits multiple sibling `subagent` tool calls in one turn. Pi executes sibling tool calls concurrently and waits for all of them before returning their results to the parent model.
+
+The extension therefore does not need its own task-array syntax, scheduler, or parallel-result protocol.
+
+### Receipts without context pollution
+
+The human sees live child activity in Pi's TUI. The parent receives a compact result with a session path. The complete Pi session remains available for diagnosis or direct continuation without being copied into the parent's context by default.
+
+## Deliberate boundaries
+
+This extension provides one synchronous child run per tool call. It intentionally does not add:
+
+- named-agent or persona files;
+- a chain/workflow language;
+- a custom parallel scheduler;
+- asynchronous job handles;
+- polling, heartbeats, or background result delivery;
+- a separate child-to-parent messaging system.
+
+Pi skills and prompt templates can provide reusable delegation patterns. Pi's native parallel tool execution handles fan-out. Return, timeout, persisted sessions, and resume provide the control loop.
 
 ## Install
 
 ```bash
-# git (no npm account needed)
+# Git
 pi install git:github.com/eggmasonvalue/pi-subagent
 
-# or npm
+# npm
 pi install npm:@eggmasonvalue/pi-subagent
 
-# try it for one run without installing
+# Try it for one run
 pi -e git:github.com/eggmasonvalue/pi-subagent
 ```
 
-Then `/reload` (or restart pi) and the `subagent` tool is available. See
-[Model allowlist](#model-allowlist-optional-recommended) for the optional one-time config
-step.
+Restart Pi or run `/reload` after installation or local edits.
 
-> **Security:** pi packages run with full system access — extensions execute arbitrary
-> code. Review the source before installing. This one spawns child `pi` processes and
-> reads/writes session JSONL under `~/.pi/agent/sessions/subagent/`.
+> Pi packages execute with your system permissions. Review third-party extension code before installing it.
 
----
+## Using it
 
-## What this is solving for
+Normally, you ask the main agent in natural language and let it construct the tool call.
 
-Pi ships without built-in subagents on purpose. Mario Zechner's objections to the way
-other harnesses (e.g. Claude Code) do subagents are specific and worth keeping in mind,
-because this extension is built to answer each one:
-
-| The usual complaint | What this extension does |
-|---|---|
-| **"Black box within a black box."** You can't see what the subagent did. | Each child's **full transcript is persisted to a session JSONL**, and the file path is returned in the result — in a terse `[status=… model=… session=…]` envelope so the supervisor sees *which model ran and how it went* without opening anything. You (or the main agent) can open the JSONL and read every step. |
-| **Painful to debug.** If a child makes a mistake, you can't replay or correct its conversation. | **`resume` is first-class.** The session file is a normal pi session: `read` it to diagnose, then `subagent { resume, task: <correction> }` to continue the **same** context with a steering prompt — the child keeps everything it learned, plus your fix. Inspect → steer → continue, no lost work. |
-| **Poor context transfer.** The orchestrator decides what the child sees, opaquely. | Context is explicit: the main agent writes the child's `task` (and optionally an inline `systemPrompt`, `model`, `tools`). Nothing hidden — and on `resume` the correction is just the next turn. |
-| **Context pollution.** People reach for subagents mid-session to "save context," then dump tool output back into the parent anyway. | The model only sees the child's **final output** (capped), not its streaming internals. Full detail lives in the session file and tool `details`, off to the side. |
-| **All-or-nothing on interrupt.** Kill a fan-out and you lose the work that already finished. | **Abort & timeout flush partial results.** On Ctrl+C / `/interrupt` / `timeoutMs`, completed tasks return their full output, in-flight tasks return partial output, and **every task keeps its own session path** — each one inspectable and `resume`-able. No work silently discarded, no sessions-dir archaeology. |
-
-The net effect: you get the *one* genuinely useful property of subagents — an **isolated
-context window for a focused sub-task** — without giving up observability or steerability.
-Two features make that real rather than aspirational:
-
-- **`resume`** turns every child into something you can *inspect, correct, and continue* — the steerability a black-box subagent can't offer.
-- **abort/timeout partial-flush** means interrupting is safe: you never trade away finished work to stop a runaway, and the receipts for *un*finished work are right there to resume from.
-
-### Why no persona files
-
-Popular subagents have every subagent as a human-written `agent.md` persona.
-We removed that as the default. A SOTA supervisor model knows how to frame a sub-task and
-adopt a persona far better than a static file written ahead of time. So by default this
-tool runs **inline**: the main agent supplies the task (and optionally a system prompt) at
-call time. Named agent files are still supported as an *optional* convenience, not a
-requirement.
-
----
-
-## How it works
-
-```
-main pi session
-   └─ subagent tool call
-        └─ spawns:  pi --mode json -p --session-dir <run-dir> [--model ...] [--tools ...] "Task: ..."
-              ├─ streams progress to YOU (the human) live, in the tool row
-              ├─ writes its full conversation to <run-dir>/<timestamp>_<uuid>.jsonl
-              └─ returns a concise final output (+ session path) to the MAIN AGENT
+```text
+Delegate an isolated investigation of the authentication flow. Return the relevant files,
+control flow, and unresolved questions.
 ```
 
-Two streams, deliberately separated:
-
-- **To the human:** live streaming of tool calls and progress (observability). This does
-  **not** enter the main agent's context.
-- **To the main agent:** only the final output, byte-capped, prefixed with a terse
-  `[key=value …]` envelope (status, model, `label`, `session=<path>`, cost) so it can
-  correlate quality↔model and read the full trace if it wants to verify, debug, or
-  `resume`. See [Result envelope](#result-envelope).
-
-Child sessions are written under:
-
-```
-~/.pi/agent/sessions/subagent/<runId>/<session>.jsonl
+```text
+Use separate subagents in parallel to inspect the API layer, persistence layer, and test
+coverage. Give each one only the tools it needs.
 ```
 
----
-
-## Usage
-
-You normally don't call this yourself — you ask the main agent in plain language and it
-decides to use the tool. Examples:
-
-```
-Scan this repo in an isolated context and tell me where auth is handled.
-
-Run 3 subagents in parallel: one to map the data models, one the API routes,
-one the background jobs. Summarize each.
-
-Chain: first have a subagent find the rate-limiting code, then have another
-propose a fix based on what it found.
+```text
+Give a subagent two minutes to investigate this intermittent failure. If it times out,
+resume it for a concise status report before deciding what to try next.
 ```
 
-### Modes
+The parent can specify the expected output directly in `task`, including a role, constraints, definition of done, or a structured response format. There is no separate persona or system-prompt parameter.
 
-| Mode | Shape | Use when |
-|------|-------|----------|
-| **Single** | `{ task }` | One focused isolated task. |
-| **Parallel** | `{ tasks: [{ task }, ...] }` | Independent tasks that don't touch the same files. |
-| **Chain** | `{ chain: [{ task }, ...] }` | Sequential steps; `{previous}` in a task is replaced with the prior step's output. |
+## Tool interface
 
-### Per-call options (all optional)
+A fresh run uses:
 
-- `systemPrompt` — inline persona/instructions for the child.
-- `model` — e.g. `sonnet`, `provider/id`.
-- `thinking` — optional passthrough to child `--thinking` (no hardcoded validation in this extension).
-- `tools` — allowlist, e.g. `["read", "grep", "find", "ls"]` for a read-only scout.
-- `cwd` — working directory for the child process.
-- `agent` — name of a `*.md` agent file (optional; see below).
-- `label` — a correlation tag echoed back in the result envelope (e.g. the repo/feature a task maps to). Removes guesswork when fanning out.
-- `resume` — exact JSONL path from a prior result's `session=` field (see **Resume**).
-- `timeoutMs` — kill the child after N ms and return its partial output with `status=timeout` (see **Timeouts**).
-
-### Result envelope
-
-Subagent output is consumed by the **main agent**, not a human, so each task's result is
-prefixed with one terse machine-parsable line carrying only what the *tool* uniquely knows:
-
-```
-[label=harden-repo-3 agent=inline status=done model=github-copilot/gpt-5.3-codex thinking=low timeoutMs=120000 turns=7 cost=0.0413 exit=end session=/…/<id>.jsonl]
-<the child's own final output, verbatim, byte-capped>
-```
-
-`status` is one of `done` / `failed` / `timeout` / `aborted` / `never-started` / `policy-blocked`. The tool does
-**not** wrap or reformat the child's payload — if you want JSON back, tell the child (via
-`task`/`systemPrompt`) to emit JSON. The rich TUI rendering for the human lives in tool
-`details` and never enters the main agent's context.
-
-### Abort & partial results
-
-On Ctrl+C / `/interrupt`, the tool **no longer discards completed work**. Every task that
-finished returns its full output; in-flight tasks return partial output with
-`status=aborted`; tasks that hadn't launched return `status=never-started`. **Every task
-keeps its own `session=` path**, so nothing requires digging through the sessions dir. The
-aggregate header reports the mix (e.g. `2 done · 1 aborted · 1 never-started`) and points
-you at `subagent { resume }` for the unfinished ones.
-
-### Resume
-
-Resume continues the **same** session file (appends the next turn via `pi --session`), so the
-child keeps its cache-compatible runtime configuration and prior context:
-
-```
+```ts
 subagent {
-  resume: "/…/sessions/subagent/<runId>/<id>.jsonl",   // exact session= JSONL path
-  task: "You looped on the import. The package is `foo`, not `foo-py`. Fix pyproject and re-run tests.",
+  task: string;
+  label?: string;
+  model?: string;
+  thinking?: string;
+  tools?: string[];
+  cwd?: string;
+  timeoutMs?: number;
+}
+```
+
+A continuation uses:
+
+```ts
+subagent {
+  task: string;
+  resume: string;
+  label?: string;
+  timeoutMs?: number;
+}
+```
+
+### Parameters
+
+| Parameter | Meaning |
+|---|---|
+| `task` | Self-contained assignment. On resume, this is the answer, correction, or next direction appended to the existing child session. |
+| `label` | Optional correlation label returned with the result. Useful when several sibling calls run concurrently. |
+| `model` | Pi model pattern or `provider/id` for a fresh run. With an enabled allowlist, it must exactly match an allowed ID. Omit it to use the configured default. |
+| `thinking` | Reasoning level for a fresh run. When model policy defines allowed levels, this is required and must match one of them. |
+| `tools` | Child tool allowlist. Choose the narrowest set that can complete the task. |
+| `cwd` | Child working directory. Omit it to inherit the parent working directory. Setting it at startup controls path resolution and project-resource discovery. |
+| `timeoutMs` | Review horizon in milliseconds. No timeout is imposed when omitted. |
+| `resume` | Exact session JSONL path returned by an earlier call. Runtime configuration comes from the saved session. |
+
+Fresh-run configuration such as `model`, `thinking`, `tools`, and `cwd` is not changed during resume. Start a new child when different runtime configuration is required.
+
+## The supervision loop
+
+### Normal completion
+
+The child returns its final answer. The parent uses it directly or delegates follow-up work.
+
+### Clarification or blocker
+
+Every fresh child is told to return rather than guess when it cannot proceed reliably without clarification, a decision, or missing information.
+
+The parent resumes it with the answer:
+
+```ts
+subagent {
+  resume: "<session path from the prior result>",
+  task: "Use the internal OAuth provider; backward compatibility with API keys is not required. Continue.",
   timeoutMs: 120000
 }
 ```
 
-- `resume` must be the exact JSONL path shown in a previous result's `session=` field, not a session id, label, run id, or basename.
-- `task` is **required** on a resume (it's the steering prompt) and is appended as the next user turn.
-- Runtime fields (`agent` / `systemPrompt` / `model` / `thinking` / `tools` / `cwd`) are ignored on resume; the original session owns them for provider prefix-cache compatibility. Only `timeoutMs` and `label` affect the resumed invocation.
-- Typical loop: a child aborts/times out → `read` its `session` JSONL to diagnose → `subagent { resume: <session-jsonl-path>, task: <correction> }`.
-- Works in single, parallel, and chain.
+### Timeout
 
-### Timeouts
+When the review horizon expires, the child process tree is stopped and returns:
 
-`timeoutMs` bounds a run: on expiry the child gets `SIGTERM` (then `SIGKILL` after a grace
-period) and returns its **partial output** with `status=timeout` and its session path —
-never an exception, same flush path as abort. There is **no default timeout**; unbounded
-fire-and-await is the default.
+- `status=timeout`;
+- any useful partial output already produced;
+- the persisted session path once the child initialized its session.
 
-> **KV-cache caveat.** Killing a child throws away the provider-side prompt cache (warm KV
-> prefix), which has a short idle TTL (~5 min on most labs). A `resume` after the TTL
-> lapses re-prefills the whole context at full input price. If you time out and intend to
-> continue, **resume promptly** to maximize cache hits. A bare timeout with no resume plan
-> pays for work twice — prefer it only as a genuine hang guard.
+The usual next step is to resume the child and ask it to summarize its current state, then resume again with direction if necessary. This is preferable to loading a large raw transcript into the parent context.
 
-### Discovering models
+### Human intervention
 
-```
-subagent { listModels: true }
+Press Escape to interrupt a running delegation. Completed work and the child session are retained where possible. The human can then ask the parent to resume with new direction instead of waiting for the original timeout.
+
+After the child is no longer running, its session can also be opened directly:
+
+```bash
+pi --session "/path/from/the-result.jsonl"
 ```
 
-Returns compact model-policy JSON: `columns` plus `models` rows, the resolved `default`,
-whether the policy is enabled, and the config path. No subagent is spawned.
+Do not open the same session interactively while its worker process is still writing to it.
 
-### Note on progress
+## Parallel work
 
-Subagent calls are **synchronous fire-and-await**: the main agent's loop is suspended for
-the entire call, so there is no live channel back to the model mid-run (a "heartbeat" to
-the orchestrator is structurally impossible). The human *does* see live streaming in the
-TUI. The synchronous answer to "what if it hangs" is `timeoutMs` + `resume`, not a heartbeat.
+Parallelism is expressed through ordinary Pi tool calls, not a special subagent mode. The parent should issue multiple sibling calls when tasks are independent.
 
-### Named agents (optional)
+Each call has its own:
 
-If you *do* want reusable personas, drop markdown files in:
+- task and label;
+- model and thinking level;
+- tool allowlist;
+- timeout;
+- result and session receipt.
 
-- `~/.pi/agent/agents/*.md` — user-level (always available)
-- `.pi/agents/*.md` — project-level (only with `agentScope: "project"` or `"both"`)
+Pi runs the calls concurrently, streams each tool row independently, and sends all finalized results to the parent model before its next turn.
 
-```markdown
----
-name: scout
-description: Fast read-only codebase recon
-tools: read, grep, find, ls
-model: claude-haiku-4-5
----
+Avoid assigning overlapping file edits to concurrent children unless the work has been explicitly partitioned.
 
-You are a fast scout. Find the relevant code and report concise, cited findings.
+## Models and benchmark-informed selection
+
+Model policy is optional. When enabled, it constrains which child models and thinking levels may be selected. The parent remains free to choose the best permitted configuration for each task.
+
+The zero-argument `subagent_models` tool returns the curated catalog on demand. Its compact response includes:
+
+- exact model IDs;
+- permitted thinking levels;
+- optional benchmark data for each level;
+- optional user-written descriptions;
+- the configured default.
+
+The parent should normally call it once when model choice matters and reuse that result for later delegations. The catalog is not injected into every system prompt.
+
+### Configure the allowlist
+
+Create the active policy from `extensions/subagent/models-allowlist.example.json`. From a package checkout, you can copy it with:
+
+From Bash:
+
+```bash
+mkdir -p ~/.pi/agent/pi-subagent
+cp extensions/subagent/models-allowlist.example.json ~/.pi/agent/pi-subagent/models-allowlist.json
 ```
 
-Then: *"use scout to find the auth code"*. Inline `model`/`tools` passed at call time
-override the file's values.
+From PowerShell:
 
-### Model allowlist (optional, recommended)
-
-To hard-restrict which child models can be used, copy
-`extensions/subagent/models-allowlist.example.json` to:
-
-`~/.pi/agent/extensions/subagent/models-allowlist.json`
-
-Then edit the copied file with the model IDs and thinking levels you want to allow.
-
-A populated entry looks like this after benchmark data has been refreshed:
-
-```json
-{
-  "id": "github-copilot/gpt-5.5",
-  "levels": {
-    "high": {
-      "artificialAnalysis": {
-        "intelligence": 55.1,
-        "coding": 70.8,
-        "cost": 4.63
-      },
-      "deepSWE": {
-        "pass": 0.619,
-        "cost": 4.47
-      }
-    },
-    "xhigh": {
-      "artificialAnalysis": {
-        "intelligence": 57.2,
-        "coding": 74.1,
-        "cost": 6.61
-      },
-      "deepSWE": {
-        "pass": 0.700,
-        "cost": 6.61
-      }
-    }
-  },
-  "description": "Strong coding model"
-}
+```powershell
+New-Item -ItemType Directory -Force "$HOME/.pi/agent/pi-subagent" | Out-Null
+Copy-Item extensions/subagent/models-allowlist.example.json "$HOME/.pi/agent/pi-subagent/models-allowlist.json"
 ```
 
-Artificial Analysis provides composite intelligence, coding, and cost metrics. DeepSWE provides coding-agent pass rate and cost. Either source is optional; an empty source or level means no matching data has been imported yet. Benchmark values are advisory; pi model metadata remains authoritative for capability validation.
+The active policy is read from `~/.pi/agent/pi-subagent/models-allowlist.json` (`%USERPROFILE%\\.pi\\agent\\pi-subagent\\models-allowlist.json` on Windows), independently of whether the package was installed from npm or Git. `PI_CODING_AGENT_DIR` replaces the `~/.pi/agent` base when set.
 
-It supports either plain model ids (strings) or richer objects with an `id`, optional `levels`, and an optional human-readable `description`. Benchmark values under `levels` are formatted into the compact model-facing output described by `levelsLegend`. Unknown extra fields are preserved in the JSON but are not included in the compact `listModels` response:
+A model entry may be a plain ID or an object with per-level metadata:
 
 ```json
 {
   "enabled": true,
+  "default": "github-copilot/gpt-5.3-codex",
   "allowed": [
     {
       "id": "github-copilot/gpt-5.3-codex",
+      "description": "Strong default for coding tasks",
       "levels": {
         "low": {},
-        "medium": {},
-        "high": {},
-        "xhigh": {}
-      },
-      "description": "Great default for most coding tasks"
-    },
-  ],
-  "default": "github-copilot/gpt-5.3-codex"
+        "high": {
+          "artificialAnalysis": {
+            "intelligence": 55.1,
+            "coding": 70.8,
+            "cost": 4.63
+          },
+          "deepSWE": {
+            "pass": 0.619,
+            "cost": 4.47
+          }
+        }
+      }
+    }
+  ]
 }
 ```
 
-Behavior when enabled:
+When a non-empty `levels` object is present, `thinking` is required and its value must match one of the keys. Omitting `levels` leaves thinking unrestricted for that entry.
 
-- Effective model resolution is: inline `model` → named-agent `model` → allowlist `default`.
-- The resolved model must match an allowed `id` exactly.
-- **`levels` is enforced, not just descriptive.** If an allowed entry includes a `levels` object, the resolved `thinking` value must be one of its keys or the call fails (fresh runs only — `thinking` can't be passed on `resume` at all). Remove a level key (e.g. remove `"xhigh"`) to block it for that model. Omit the `levels` key on an entry entirely to leave thinking unrestricted for that model.
-- If no model resolves and no `default` is set, the call fails early.
-- If the file is missing, policy is disabled (legacy behavior).
-- `subagent { listModels: true }` returns compact policy JSON as `{ columns, models, default, allowlistEnabled, configPath }`.
-- **Resume is checked too.** `resume` bypasses model *resolution* (the model is fixed by the resumed session, not re-specified), but the policy is still enforced reactively: as soon as the resumed child reports which model it's actually running, the tool checks it against the allowlist and kills the child immediately (`status=policy-blocked`) if it's not allowed — e.g. a session started before the model was removed from `allowed`. There is no way to "fix" a blocked resume in place (the model is fixed by the session); start a fresh run with an allowed model instead.
+If the allowlist file is absent, model policy is disabled and the child may use Pi's normal model configuration.
 
-**Security:** project-local agents are repo-controlled prompts. By default only user-level
-agents load. Enable project agents with `agentScope: "both"` (or `"project"`), and the tool
-will prompt for confirmation before running them interactively
-(`confirmProjectAgents: false` to disable).
+### Refresh optional benchmark data
 
-### Refreshing benchmark data
-
-The allowlist is edited directly in `models-allowlist.json`. To refresh the optional
-per-level data for configured entries, run from the package checkout:
+The refresh scripts always update the active policy at
+`~/.pi/agent/pi-subagent/models-allowlist.json`, regardless of whether this package was
+installed from npm or Git. From a package checkout, run:
 
 ```bash
 bun extensions/subagent/refresh-aa-benchmarks.ts
 bun extensions/subagent/refresh-deepswe-benchmarks.ts
 ```
 
-Missing benchmark pages or rows are reported as warnings and do not remove configured
-models or thinking levels. Benchmark data is advisory; runtime validation uses pi's model metadata.
-
----
-
-## Output & limits
-
-- **Collapsed view:** status, last few items, usage stats (turns, tokens, cost, context).
-- **Expanded view (Ctrl+O):** full task, tool calls, final output as Markdown, per-task usage.
-- Parallel model-visible output is capped at **50 KB per task**; the full result stays in
-  tool `details` and in the child's session file.
-- **Abort:** Ctrl+C / `/interrupt` kills child processes but **flushes partial results** — completed tasks return their output, in-flight tasks return partial output, and every task keeps its session path (see **Abort & partial results**).
-- Parallel mode is limited to 8 tasks, 4 concurrent.
-
----
-
-## Debugging a subagent run
-
-When a child's summary looks off, let you or the agent read the receipts:
+For tests or another policy file, pass an explicit path with `--config`:
 
 ```bash
-# the session path is shown live in the tool row as soon as the child starts,
-# and is included in the final result, e.g.
-~/.pi/agent/sessions/subagent/1718000000000-ab12cd/2026....jsonl
-
-# inspect it
-pi --session <that-file>      # resume / browse with /tree
-# or just have the main agent `read` the file
+bun extensions/subagent/refresh-aa-benchmarks.ts --config /tmp/models-allowlist.json
+bun extensions/subagent/refresh-deepswe-benchmarks.ts --config /tmp/models-allowlist.json
 ```
 
-The path is surfaced **at the start** of the child run (not just the end), so you can
-open or `tail -f` the JSONL while it's still working. It is also attached to the result
-**even if the run is aborted** (Ctrl+C) or crashes — which is exactly when you want the
-partial trace.
+Benchmark values inform model choice; Pi's model metadata remains authoritative for capability validation. Users may omit benchmark fields and rely entirely on their own descriptions.
 
-That file path *is* the whole observability story. No supervisor loop, no telemetry
-schema — just a pointer to the full conversation.
+## Context and capabilities
 
----
+A child is a normal Pi process. It starts in the selected working directory and receives Pi's applicable project context and resources.
+
+Use `tools` to remove capabilities that are unnecessary for the delegated task. For example, a read-only investigation might receive:
+
+```json
+["read", "grep", "find", "ls"]
+```
+
+Recursive delegation is not enabled for children by default. Include `subagent` explicitly in the child's tools only when that child genuinely needs to orchestrate further isolated work.
+
+The goal is not to disable resources indiscriminately. Resources that do not affect the model's context or capabilities need no special treatment; relevant project instructions and skills should remain available.
+
+## Results and sessions
+
+A result begins with a compact envelope followed by the child's final or partial text:
+
+```text
+[label=auth-audit status=done model=provider/model thinking=high turns=6 cost=0.0413 exit=stop session=/.../child.jsonl]
+<child output>
+```
+
+Possible statuses include:
+
+- `done`
+- `failed`
+- `timeout`
+- `aborted`
+
+The envelope contains orchestration facts known by the extension. The child's payload is otherwise returned without imposing a universal report format.
+
+Child sessions are stored beneath Pi's session directory in a `subagent` run directory. The returned `session` path is both the resume handle and the diagnostic receipt.
+
+Session JSONL is intended primarily for debugging and verification. It contains structured conversation entries and may contain opaque provider reasoning data. When inspecting it programmatically, focus on user, assistant, and tool-result messages rather than attempting to interpret encrypted reasoning fields.
+
+## Human-visible output
+
+During a run, Pi's tool row shows useful child activity without adding that stream to the parent model's context:
+
+- assistant progress;
+- tool calls;
+- completion or failure state;
+- model and usage information;
+- session path.
+
+Expand the tool row with Pi's normal tool-output control for more detail. The persisted session is the authoritative complete record.
+
+## Output limits
+
+Model-facing child output is capped at 50 KB per invocation to protect the parent context. The full conversation remains available in the persisted child session and tool details.
+
+Child built-in tools retain Pi's own output-truncation behavior.
+
+## Implementation overview
+
+```text
+parent Pi session
+  └─ subagent tool call
+       └─ child Pi process in JSON mode
+            ├─ isolated model context
+            ├─ normal Pi tools and project resources
+            ├─ live events rendered in the parent TUI
+            ├─ persisted child session
+            └─ concise final or partial result returned to the parent
+```
+
+The extension relies on Pi rather than recreating it:
+
+- Pi processes provide isolation;
+- Pi JSON events provide live observation;
+- Pi sessions provide persistence and resume;
+- Pi tool execution provides sibling-call parallelism;
+- Pi model and tool flags configure each child;
+- Pi's TUI supports compact and expanded rendering.
+
+The extension supplies the thin control layer connecting those capabilities.
 
 ## Files
 
-```
+```text
 pi-subagent/
-├── package.json                          # pi manifest (extensions entry, peerDeps)
-├── README.md                             # this file
+├── package.json
+├── README.md
 └── extensions/
     └── subagent/
-        ├── index.ts                      # the extension (tool registration, spawning, rendering)
-        ├── agents.ts                     # optional named-agent discovery
-        ├── models-allowlist.example.json # policy template
-        ├── refresh-aa-benchmarks.ts     # refreshes per-level Artificial Analysis data
-        └── refresh-deepswe-benchmarks.ts # refreshes per-level DeepSWE data
+        ├── index.ts
+        ├── benchmark-config.ts
+        ├── models-allowlist.example.json
+        ├── refresh-aa-benchmarks.ts
+        └── refresh-deepswe-benchmarks.ts
 ```
 
-## Reload
+## License
 
-After installing (or editing) run `/reload` in pi — or restart pi — to pick up changes.
+MIT

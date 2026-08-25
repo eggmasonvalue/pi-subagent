@@ -1,188 +1,69 @@
-/**
- * Subagent Tool - Delegate tasks to specialized agents
- *
- * Spawns a separate `pi` process for each subagent invocation,
- * giving it an isolated context window.
- *
- * Supports three modes:
- *   - Single: { agent: "name", task: "...", thinking?: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "...", thinking?: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ...", thinking?: "..." }, ...] }
- *
- * Uses JSON mode to capture structured output from subagents.
- */
-
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum, type Message, type Usage } from "@earendil-works/pi-ai";
 import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
-	withFileMutationQueue,
+	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
+const CHILD_SYSTEM_GUIDANCE =
+	"Work independently on the delegated task. If you cannot proceed reliably without clarification, a decision, or missing information, stop and return the precise question or blocker to your supervisor. Do not guess or wait. Your supervisor can resume this session with an answer.";
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const CHILD_METADATA_SUFFIX = ".subagent.json";
+const INTERNAL_TOOL_NAMES = new Set(["subagent", "subagent_models"]);
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
 
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-	thinking?: string,
-): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	}
-	if (model) parts.push(model);
-	if (thinking) parts.push(thinking);
-	return parts.join(" ");
-}
-
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
-): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
-	}
-}
-
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
+interface UsageStats extends Usage {
 	turns: number;
 }
 
-interface SingleResult {
-	agent: string;
-	agentSource: "user" | "project" | "inline" | "unknown";
-	task: string;
-	/** Optional caller-supplied correlation label, echoed in the model-facing envelope. */
-	label?: string;
-	/** True when this item was a resume of an existing session rather than a fresh run. */
-	resumed?: boolean;
+interface ChildMetadata {
+	version: 2;
+	cwd: string;
+	model?: string;
 	thinking?: string;
+	tools: string[];
+}
+
+interface ToolActivity {
+	id: string;
+	name: string;
+	args: Record<string, unknown>;
+	status: "running" | "done" | "error";
+}
+
+interface SubagentResult {
+	task: string;
+	label?: string;
+	resumed: boolean;
 	timeoutMs?: number;
 	exitCode: number;
 	messages: Message[];
+	toolActivity: ToolActivity[];
+	partialText: string;
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	thinking?: string;
 	stopReason?: string;
 	errorMessage?: string;
-	step?: number;
-	/** Absolute path to the child's persisted session JSONL, for observability/debugging. */
 	sessionFile?: string;
-	/** Child session id from the JSON session header. */
 	sessionId?: string;
 }
 
-/**
- * A fully-resolved run spec. Either derived from a named agent file or
- * constructed inline from tool params. The main agent is the intelligence:
- * it can author a systemPrompt on the fly without a human-written .md file.
- */
-interface ResolvedSpec {
-	name: string;
-	source: "user" | "project" | "inline";
-	model?: string;
-	thinking?: string;
-	tools?: string[];
-	systemPrompt: string;
+interface SubagentDetails {
+	result: SubagentResult;
 }
 
 interface ModelAllowlistLevel {
@@ -193,6 +74,7 @@ interface ModelAllowlistLevel {
 interface ModelAllowlistEntry {
 	id: string;
 	levels?: Record<string, ModelAllowlistLevel>;
+	description?: string;
 	[key: string]: unknown;
 }
 
@@ -205,1473 +87,808 @@ interface ModelAllowlistConfig {
 interface ModelPolicy {
 	enabled: boolean;
 	allowed: Set<string>;
-	/** Raw metadata objects keyed by model id, for models defined as objects in the allowlist. */
 	metadata: Map<string, ModelAllowlistEntry>;
 	defaultModel?: string;
 	configPath: string;
 }
 
-function getModelAllowlistPath(): string {
-	return path.join(import.meta.dirname, "models-allowlist.json");
+interface RunConfig {
+	cwd: string;
+	model?: string;
+	thinking?: string;
+	tools: string[];
 }
 
-function loadModelPolicy(): { policy: ModelPolicy; error?: string } {
-	const configPath = getModelAllowlistPath();
-	const basePolicy: ModelPolicy = {
+const EMPTY_USAGE = (): UsageStats => ({
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	turns: 0,
+});
+
+function getModelAllowlistPath(): string {
+	return path.join(getAgentDir(), "pi-subagent", "models-allowlist.json");
+}
+
+function loadModelPolicy(configPath = getModelAllowlistPath()): { policy: ModelPolicy; error?: string } {
+	const disabled: ModelPolicy = {
 		enabled: false,
-		allowed: new Set<string>(),
-		metadata: new Map<string, ModelAllowlistEntry>(),
-		defaultModel: undefined,
+		allowed: new Set(),
+		metadata: new Map(),
 		configPath,
 	};
-
-	if (!fs.existsSync(configPath)) return { policy: basePolicy };
+	if (!fs.existsSync(configPath)) return { policy: disabled };
 
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+		parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
 	} catch (error) {
 		return {
-			policy: basePolicy,
-			error: `Invalid JSON in model allowlist: ${configPath} (${error instanceof Error ? error.message : String(error)})`,
+			policy: disabled,
+			error: `Invalid JSON in model allowlist: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
-
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { policy: basePolicy, error: `Model allowlist must be a JSON object: ${configPath}` };
+		return { policy: disabled, error: "Model allowlist must be a JSON object." };
 	}
 
 	const config = parsed as ModelAllowlistConfig;
 	if (config.enabled !== undefined && typeof config.enabled !== "boolean") {
-		return { policy: basePolicy, error: `"enabled" must be boolean in ${configPath}` };
+		return { policy: disabled, error: 'Model allowlist field "enabled" must be boolean.' };
 	}
 	if (config.allowed !== undefined && !Array.isArray(config.allowed)) {
-		return { policy: basePolicy, error: `"allowed" must be an array of model strings or objects in ${configPath}` };
+		return { policy: disabled, error: 'Model allowlist field "allowed" must be an array.' };
 	}
 	if (config.default !== undefined && typeof config.default !== "string") {
-		return { policy: basePolicy, error: `"default" must be a model string in ${configPath}` };
+		return { policy: disabled, error: 'Model allowlist field "default" must be a string.' };
 	}
 
 	const metadata = new Map<string, ModelAllowlistEntry>();
-	const allowed = new Set(
-		(config.allowed ?? []).flatMap((entry) => {
-			if (typeof entry === "string") {
-				const id = entry.trim();
-				return id ? [id] : [];
-			}
-			if (entry && typeof entry === "object" && typeof entry.id === "string") {
-				const id = entry.id.trim();
-				if (id) {
-					metadata.set(id, entry);
-					return [id];
-				}
-			}
-			return [];
-		}),
-	);
+	const allowed = new Set<string>();
+	for (const raw of config.allowed ?? []) {
+		if (typeof raw === "string") {
+			const id = raw.trim();
+			if (id) allowed.add(id);
+			continue;
+		}
+		if (raw && typeof raw === "object" && typeof raw.id === "string" && raw.id.trim()) {
+			const entry = { ...raw, id: raw.id.trim() };
+			allowed.add(entry.id);
+			metadata.set(entry.id, entry);
+		}
+	}
+
 	const enabled = config.enabled ?? true;
 	const defaultModel = config.default?.trim() || undefined;
-
 	if (enabled && allowed.size === 0) {
-		return { policy: basePolicy, error: `Model allowlist is enabled but "allowed" is empty in ${configPath}` };
+		return { policy: disabled, error: 'Model allowlist is enabled but "allowed" is empty.' };
 	}
 	if (enabled && defaultModel && !allowed.has(defaultModel)) {
-		return {
-			policy: basePolicy,
-			error: `"default" model must be present in "allowed" in ${configPath}`,
-		};
+		return { policy: disabled, error: 'The default model must also appear in "allowed".' };
 	}
 
-	return {
-		policy: {
-			enabled,
-			allowed,
-			metadata,
-			defaultModel,
-			configPath,
-		},
-	};
+	return { policy: { enabled, allowed, metadata, defaultModel, configPath } };
 }
 
-function compactModelList(policy: ModelPolicy): { columns: string[]; models: unknown[][] } {
-	const columns = ["id", "levels", "description"];
-	const entries = Array.from(policy.allowed).map((id) => policy.metadata.get(id) ?? { id });
-	const formatLevels = (levels: unknown): string => {
-		if (!levels || typeof levels !== "object" || Array.isArray(levels)) return "";
-		return Object.entries(levels as Record<string, ModelAllowlistLevel>)
-			.map(([level, value]) => {
-				const parts: string[] = [];
-				const aa = value?.artificialAnalysis;
-				if (aa) {
-					const quality = [aa.intelligence, aa.coding]
-						.filter((metric): metric is number => typeof metric === "number")
-						.map((metric) => metric.toFixed(1))
-						.join("/");
-					parts.push(`AA ${quality || "?"}${typeof aa.cost === "number" ? `/$${aa.cost}` : ""}`);
-				}
-				const deepSWE = value?.deepSWE;
-				if (deepSWE) {
-					const pass = typeof deepSWE.pass === "number" ? `${Math.round(deepSWE.pass * 100)}%` : "?";
-					parts.push(`DeepSWE ${pass}${typeof deepSWE.cost === "number" ? `/$${deepSWE.cost}` : ""}`);
-				}
-				return `${level}: ${parts.join(" · ") || "unbenchmarked"}`;
-			})
-			.join(" · ");
-	};
-
-	return {
-		columns,
-		models: entries.map((entry) => [entry.id, formatLevels(entry.levels), entry.description ?? null]),
-	};
-}
-
-/**
- * The keys under `levels` are the per-model thinking levels permitted by policy.
- */
-function getAllowedThinkingLevels(entry: ModelAllowlistEntry | undefined): string[] | undefined {
-	const levels = entry?.levels;
-	if (!levels || typeof levels !== "object" || Array.isArray(levels)) return undefined;
-	const names = Object.keys(levels);
-	return names.length > 0 ? names : undefined;
+function allowedThinkingLevels(entry: ModelAllowlistEntry | undefined): string[] | undefined {
+	if (!entry?.levels || typeof entry.levels !== "object" || Array.isArray(entry.levels)) return undefined;
+	const levels = Object.keys(entry.levels);
+	return levels.length > 0 ? levels : undefined;
 }
 
 function validateModelPolicy(policy: ModelPolicy, registry: { getAll(): any[] }): string[] {
 	if (!policy.enabled) return [];
 	const errors: string[] = [];
-	const models = new Map<string, any>();
-	for (const model of registry.getAll()) models.set(`${model.provider}/${model.id}`, model);
+	const known = new Map<string, any>();
+	for (const model of registry.getAll()) known.set(`${model.provider}/${model.id}`, model);
 
 	for (const id of policy.allowed) {
-		const entry = policy.metadata.get(id);
-		const model = models.get(id);
+		const model = known.get(id);
 		if (!model) {
-			errors.push(`Allowlisted model "${id}" is not known to pi.`);
+			errors.push(`Allowlisted model "${id}" is not known to Pi.`);
 			continue;
 		}
-		for (const level of getAllowedThinkingLevels(entry) ?? []) {
+		for (const level of allowedThinkingLevels(policy.metadata.get(id)) ?? []) {
+			if (!THINKING_LEVEL_SET.has(level)) {
+				errors.push(`Thinking level "${level}" configured for "${id}" is not recognized by Pi.`);
+				continue;
+			}
 			if (level === "off") continue;
 			if (!model.reasoning) {
-				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
+				errors.push(`Thinking level "${level}" is unsupported by "${id}".`);
 				continue;
 			}
 			const map = model.thinkingLevelMap as Record<string, unknown> | undefined;
 			if ((level === "xhigh" || level === "max") && (!map || !(level in map) || map[level] === null)) {
-				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
+				errors.push(`Thinking level "${level}" is unsupported by "${id}".`);
 			} else if (map && level in map && map[level] === null) {
-				errors.push(`Allowlisted thinking level "${level}" is unsupported by model "${id}".`);
+				errors.push(`Thinking level "${level}" is unsupported by "${id}".`);
 			}
 		}
-	}
-	if (policy.defaultModel && !policy.allowed.has(policy.defaultModel)) {
-		errors.push(`Default model "${policy.defaultModel}" is not in the allowlist.`);
 	}
 	return errors;
 }
 
-function enforceModelPolicy(spec: ResolvedSpec, policy: ModelPolicy): { spec?: ResolvedSpec; error?: string } {
-	if (!policy.enabled) return { spec };
-
-	const model = spec.model?.trim() || policy.defaultModel;
-	if (!model) {
-		return {
-			error: `Model is required by allowlist policy. Provide \"model\" or set \"default\" in ${policy.configPath}.`,
-		};
-	}
+function resolveFreshModel(
+	requestedModel: string | undefined,
+	thinking: string | undefined,
+	policy: ModelPolicy,
+): { model?: string; error?: string } {
+	if (!policy.enabled) return { model: requestedModel?.trim() || undefined };
+	const model = requestedModel?.trim() || policy.defaultModel;
+	if (!model) return { error: "Model policy requires `model`, but no default is configured." };
 	if (!policy.allowed.has(model)) {
-		const allowedPreview = Array.from(policy.allowed).slice(0, 8).join(", ") || "(none)";
-		const extra = policy.allowed.size > 8 ? ` (+${policy.allowed.size - 8} more)` : "";
-		return {
-			error: `Model \"${model}\" is not in allowlist (${policy.configPath}). Allowed: ${allowedPreview}${extra}`,
-		};
+		return { error: `Model "${model}" is not allowed. Call subagent_models for permitted models.` };
 	}
-
-	const allowedThinking = getAllowedThinkingLevels(policy.metadata.get(model));
-	if (spec.thinking && allowedThinking && !allowedThinking.includes(spec.thinking)) {
-		return {
-			error: `Thinking level \"${spec.thinking}\" is not allowed for model \"${model}\" (${policy.configPath}). Allowed: ${allowedThinking.join(", ")}.`,
-		};
+	const levels = allowedThinkingLevels(policy.metadata.get(model));
+	if (!thinking && levels) {
+		return { error: `Thinking level is required for "${model}". Allowed: ${levels.join(", ")}.` };
 	}
-
-	return { spec: { ...spec, model } };
+	if (thinking && levels && !levels.includes(thinking)) {
+		return { error: `Thinking level "${thinking}" is not allowed for "${model}". Allowed: ${levels.join(", ")}.` };
+	}
+	return { model };
 }
 
-function resolveSpec(
-	agents: AgentConfig[],
-	item: {
-		agent?: string;
-		systemPrompt?: string;
-		model?: string;
-		thinking?: string;
-		tools?: string[];
-	},
-	policy: ModelPolicy,
-): { spec?: ResolvedSpec; error?: string } {
-	if (item.agent) {
-		const agent = agents.find((a) => a.name === item.agent);
-		if (!agent) {
-			const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-			return { error: `Unknown agent: "${item.agent}". Available agents: ${available}.` };
-		}
-		return enforceModelPolicy(
-			{
-				name: agent.name,
-				source: agent.source,
-				model: item.model ?? agent.model,
-				thinking: item.thinking,
-				tools: item.tools ?? agent.tools,
-				systemPrompt: agent.systemPrompt,
-			},
-			policy,
-		);
-	}
-	return enforceModelPolicy(
-		{
-			name: "inline",
-			source: "inline",
-			model: item.model,
-			thinking: item.thinking,
-			tools: item.tools,
-			systemPrompt: item.systemPrompt ?? "",
-		},
-		policy,
-	);
+function formatLevels(levels: unknown): string {
+	if (!levels || typeof levels !== "object" || Array.isArray(levels)) return "";
+	return Object.entries(levels as Record<string, ModelAllowlistLevel>)
+		.map(([level, value]) => {
+			const metrics: string[] = [];
+			const aa = value?.artificialAnalysis;
+			if (aa) {
+				const quality = [aa.intelligence, aa.coding]
+					.filter((metric): metric is number => typeof metric === "number")
+					.map((metric) => metric.toFixed(1))
+					.join("/");
+				metrics.push(`AA ${quality || "?"}${typeof aa.cost === "number" ? `/$${aa.cost}` : ""}`);
+			}
+			const swe = value?.deepSWE;
+			if (swe) {
+				const pass = typeof swe.pass === "number" ? `${Math.round(swe.pass * 100)}%` : "?";
+				metrics.push(`DeepSWE ${pass}${typeof swe.cost === "number" ? `/$${swe.cost}` : ""}`);
+			}
+			return `${level}: ${metrics.join(" · ") || "unbenchmarked"}`;
+		})
+		.join(" · ");
 }
 
-function failedSpecResult(name: string, task: string, step: number | undefined, error: string): SingleResult {
+function compactModelCatalog(policy: ModelPolicy, validationErrors: string[]) {
+	const entries = Array.from(policy.allowed).map((id) => policy.metadata.get(id) ?? { id });
 	return {
-		agent: name,
-		agentSource: "unknown",
-		task,
-		exitCode: 1,
-		messages: [],
-		stderr: error,
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		step,
+		allowlistEnabled: policy.enabled,
+		default: policy.defaultModel ?? null,
+		columns: ["id", "levels", "description"],
+		models: entries.map((entry) => [entry.id, formatLevels(entry.levels), entry.description ?? null]),
+		validationErrors,
+		note: policy.enabled
+			? "Use an exact row id and an allowed thinking level. Omit model to use the default."
+			: "No allowlist is configured; omit model to use the child Pi default or provide any available Pi model.",
 	};
 }
 
-interface RunItem {
-	task: string;
-	agent?: string;
-	systemPrompt?: string;
-	model?: string;
-	thinking?: string;
-	tools?: string[];
-	cwd?: string;
-	resume?: string;
-	timeoutMs?: number;
-	label?: string;
+function metadataPath(sessionFile: string): string {
+	return `${sessionFile}${CHILD_METADATA_SUFFIX}`;
 }
 
-type RunOpts = { resume?: string; timeoutMs?: number; label?: string };
-
-/**
- * Resolve an item into a runnable spec + per-run opts. Resume bypasses spec
- * resolution. Runtime-affecting params stay fixed by the original session for
- * provider prefix-cache compatibility.
- */
-function resolveRunPlan(
-	agents: AgentConfig[],
-	item: RunItem,
-	policy: ModelPolicy,
-): { spec?: ResolvedSpec; opts: RunOpts; error?: string } {
-	const opts: RunOpts = {
-		resume: item.resume?.trim() || undefined,
-		timeoutMs: item.timeoutMs,
-		label: item.label,
-	};
-	if (opts.resume) {
-		// Resume owns all runtime configuration. Ignore any wrapper-injected fresh-run
-		// fields rather than rejecting an otherwise valid continuation request.
-		if (!item.task || !item.task.trim()) {
-			return { opts, error: "resume requires a continuation `task` (the steering prompt for the resumed session)." };
-		}
-		return {
-			spec: { name: "resume", source: "inline", systemPrompt: "" },
-			opts,
-		};
-	}
-	const { spec, error } = resolveSpec(agents, item, policy);
-	return { spec, opts, error };
-}
-
-/** Tally per-status counts for the aggregate header. */
-function tallyStatuses(results: SingleResult[]): string {
-	const counts = new Map<string, number>();
-	for (const r of results) counts.set(statusOf(r), (counts.get(statusOf(r)) ?? 0) + 1);
-	const order = ["done", "failed", "policy-blocked", "timeout", "aborted", "never-started", "running"];
-	return order
-		.filter((s) => counts.has(s))
-		.map((s) => `${counts.get(s)} ${s}`)
-		.join(" \u00b7 ");
-}
-
-function unfinishedNote(results: SingleResult[]): string {
-	const stuck = results.filter((r) => r.stopReason === "aborted" || r.stopReason === "timeout");
-	if (stuck.length === 0) return "";
-	return `\n\nNote: ${stuck.length} task(s) did not finish. Resume with the exact JSONL path shown in that task's session= field: subagent { resume: <session-jsonl-path>, task: <steer> }.`;
-}
-
-function sessionFooter(result: SingleResult): string {
-	return result.sessionFile ? `\n\n\u2014 session: ${result.sessionFile}` : "";
-}
-
-/** Resolve the child's persisted session JSONL (single file in our run dir). Idempotent. */
-function resolveSessionFile(sessionDir: string, result: SingleResult): void {
-	if (result.sessionFile) return;
+function writeChildMetadata(sessionFile: string, metadata: ChildMetadata): void {
+	const destination = metadataPath(sessionFile);
+	const temporary = `${destination}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
 	try {
-		const files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
-		if (files.length > 0) result.sessionFile = path.join(sessionDir, files[0]);
+		fs.writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		fs.renameSync(temporary, destination);
+	} finally {
+		try {
+			if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+		} catch {
+			// Preserve the original metadata error.
+		}
+	}
+}
+
+function readChildMetadata(sessionFile: string): ChildMetadata {
+	const file = metadataPath(sessionFile);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(fs.readFileSync(file, "utf8"));
 	} catch {
-		/* ignore */
+		throw new Error(`Subagent runtime metadata not found or invalid: ${file}`);
 	}
+	if (!parsed || typeof parsed !== "object") throw new Error(`Invalid subagent runtime metadata: ${file}`);
+	const value = parsed as Partial<ChildMetadata>;
+	if (value.version !== 2 || typeof value.cwd !== "string" || !Array.isArray(value.tools)) {
+		throw new Error(`Invalid subagent runtime metadata: ${file}`);
+	}
+	return {
+		version: 2,
+		cwd: value.cwd,
+		model: typeof value.model === "string" ? value.model : undefined,
+		thinking: typeof value.thinking === "string" ? value.thinking : undefined,
+		tools: value.tools.filter((tool): tool is string => typeof tool === "string"),
+	};
 }
 
-function expandHome(inputPath: string): string {
-	if (inputPath === "~") return os.homedir();
-	if (inputPath.startsWith("~/") || inputPath.startsWith("~\\")) {
-		return path.join(os.homedir(), inputPath.slice(2));
-	}
-	return inputPath;
+function expandHome(input: string): string {
+	if (input === "~") return os.homedir();
+	if (input.startsWith("~/") || input.startsWith("~\\")) return path.join(os.homedir(), input.slice(2));
+	return input;
 }
 
-function resolveResumeSessionPath(inputPath: string): { path?: string; error?: string } {
-	const expanded = expandHome(inputPath.trim());
-	if (!path.isAbsolute(expanded)) {
-		return { error: "resume must be the exact child session JSONL path from a previous result's `session=` field." };
+function resolveResumePath(input: string): string {
+	const expanded = expandHome(input.trim());
+	if (!path.isAbsolute(expanded) || path.extname(expanded) !== ".jsonl") {
+		throw new Error("`resume` must be the exact absolute JSONL path returned by an earlier subagent call.");
 	}
 	const resolved = path.resolve(expanded);
-	if (path.extname(resolved) !== ".jsonl") {
-		return { error: "resume must be the exact child session JSONL path from a previous result's `session=` field." };
+	if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+		throw new Error(`Subagent session not found: ${resolved}`);
 	}
+	return resolved;
+}
+
+function resolveSessionFile(sessionDir: string, result: SubagentResult): void {
+	if (result.sessionFile) return;
 	try {
-		const stat = fs.statSync(resolved);
-		if (!stat.isFile()) return { error: `resume path is not a file: ${resolved}` };
+		const file = fs.readdirSync(sessionDir).find((name) => name.endsWith(".jsonl"));
+		if (file) result.sessionFile = path.join(sessionDir, file);
 	} catch {
-		return { error: `resume session file not found: ${resolved}` };
+		// The child may not have created its session yet.
 	}
-	return { path: resolved };
-}
-
-interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
-	results: SingleResult[];
-}
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "timeout", "never-started", "policy-blocked"]);
-
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || NON_SUCCESS_STOP_REASONS.has(result.stopReason ?? "");
-}
-
-/** Single-word status for the model-facing envelope. */
-function resolveReportedModelId(model: string, provider: string | undefined, policy: ModelPolicy): string | undefined {
-	if (policy.allowed.has(model)) return model;
-	if (provider && policy.allowed.has(`${provider}/${model}`)) return `${provider}/${model}`;
-	const matches = Array.from(policy.allowed).filter((id) => id.endsWith(`/${model}`));
-	return matches.length === 1 ? matches[0] : undefined;
-}
-
-function statusOf(result: SingleResult): string {
-	switch (result.stopReason) {
-		case "never-started":
-			return "never-started";
-		case "aborted":
-			return "aborted";
-		case "timeout":
-			return "timeout";
-		case "policy-blocked":
-			return "policy-blocked";
-	}
-	if (result.exitCode === -1) return "running";
-	return isFailedResult(result) ? "failed" : "done";
-}
-
-/**
- * The terse, model-facing header line. Carries only what the *tool* uniquely
- * knows (status, model, label, session, cost). The child's own output is passed
- * through verbatim by the caller — the tool does not impose a payload format.
- */
-function buildEnvelope(result: SingleResult): string {
-	const parts: string[] = [];
-	if (result.label) parts.push(`label=${result.label}`);
-	parts.push(`agent=${result.agent}`);
-	if (result.resumed) parts.push("resumed=true");
-	parts.push(`status=${statusOf(result)}`);
-	if (result.step) parts.push(`step=${result.step}`);
-	if (result.model) parts.push(`model=${result.model}`);
-	if (result.thinking) parts.push(`thinking=${result.thinking}`);
-	if (result.timeoutMs) parts.push(`timeoutMs=${result.timeoutMs}`);
-	if (result.usage.turns) parts.push(`turns=${result.usage.turns}`);
-	if (result.usage.cost) parts.push(`cost=${result.usage.cost.toFixed(4)}`);
-	parts.push(`exit=${result.stopReason ?? "end"}`);
-	if (result.sessionFile) parts.push(`session=${result.sessionFile}`);
-	return `[${parts.join(" ")}]`;
-}
-
-/** Envelope header + the child's verbatim (byte-capped) output. */
-function buildTaskBlock(result: SingleResult): string {
-	return `${buildEnvelope(result)}\n${truncateParallelOutput(getResultOutput(result))}`;
-}
-
-function neverStartedResult(
-	name: string,
-	agentSource: SingleResult["agentSource"],
-	task: string,
-	label: string | undefined,
-	step: number | undefined,
-): SingleResult {
-	return {
-		agent: name,
-		agentSource,
-		task,
-		label,
-		exitCode: 1,
-		messages: [],
-		stderr: "",
-		stopReason: "never-started",
-		errorMessage: "Did not start: run was aborted before this task launched.",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		step,
-	};
-}
-
-function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-	}
-	return getFinalOutput(result.messages) || "(no output)";
-}
-
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
-	}
-	return items;
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+	const bunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+	if (currentScript && !bunVirtualScript && fs.existsSync(currentScript)) {
 		return { command: process.execPath, args: [currentScript, ...args] };
 	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
+	const executable = path.basename(process.execPath).toLowerCase();
+	if (!/^(node|bun)(\.exe)?$/.test(executable)) return { command: process.execPath, args };
 	return { command: "pi", args };
 }
 
-type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
-
-async function runSingleAgent(
-	defaultCwd: string,
-	spec: ResolvedSpec,
-	task: string,
-	cwd: string | undefined,
-	step: number | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	opts?: { resume?: string; timeoutMs?: number; label?: string },
-	policy?: ModelPolicy,
-): Promise<SingleResult> {
-	const resumeInput = opts?.resume?.trim() || undefined;
-	const resumeResolution: { path?: string; error?: string } = resumeInput
-		? resolveResumeSessionPath(resumeInput)
-		: {};
-	if (resumeResolution.error) {
-		const failed = failedSpecResult(spec.name, task, step, resumeResolution.error);
-		failed.label = opts?.label;
-		failed.resumed = Boolean(resumeInput);
-		failed.timeoutMs = opts?.timeoutMs;
-		return failed;
-	}
-	const resumePath = resumeResolution.path;
-	// Persist the child's session so the main agent can read the full transcript
-	// for debugging. This is the observability bridge: a path, not a framework.
-	const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-	const sessionDir = path.join(getAgentDir(), "sessions", "subagent", runId);
-	if (!resumePath) {
-		try {
-			await fs.promises.mkdir(sessionDir, { recursive: true });
-		} catch {
-			/* best effort; pi will fall back to its default session dir */
-		}
-	}
-
-	// Resume continues the exact session file via --session. Runtime-affecting
-	// options are not passed on resume; the session owns that state.
-	const args: string[] = ["--mode", "json", "-p"];
-	if (resumePath) args.push("--session", resumePath);
-	else args.push("--session-dir", sessionDir);
-	if (!resumePath && spec.model) args.push("--model", spec.model);
-	if (!resumePath && spec.thinking) args.push("--thinking", spec.thinking);
-	if (!resumePath && spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
-
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
-
-	const currentResult: SingleResult = {
-		agent: spec.name,
-		agentSource: spec.source,
-		task,
-		label: opts?.label,
-		resumed: Boolean(resumePath),
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: resumePath ? undefined : spec.model,
-		thinking: resumePath ? undefined : spec.thinking,
-		timeoutMs: opts?.timeoutMs,
-		step,
-	};
-	// For a resume we already know which session is being continued; surface it
-	// immediately so it is attached even if the resume is aborted early.
-	if (resumePath) {
-		currentResult.sessionFile = resumePath;
-	}
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
-		}
-	};
-
-	try {
-		if (!resumePath && spec.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(spec.name, spec.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
-		}
-
-		args.push(`Task: ${task}`);
-		let wasAborted = false;
-		let wasTimeout = false;
-		let wasPolicyBlocked = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			let buffer = "";
-			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-
-			const killProc = (timeout: boolean) => {
-				if (timeout) wasTimeout = true;
-				else wasAborted = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
-
-			// Enforced on every run (not just resume) as defense-in-depth, but this is
-			// the actual hole-closer: resume bypasses resolveSpec/enforceModelPolicy
-			// entirely (the model is fixed by the resumed session), so the allowlist
-			// can only be checked reactively, once the child reports which model it's
-			// actually using.
-			const blockForPolicy = (model: string) => {
-				if (wasPolicyBlocked) return;
-				wasPolicyBlocked = true;
-				const allowedPreview = Array.from(policy?.allowed ?? []).slice(0, 8).join(", ") || "(none)";
-				const extra = policy && policy.allowed.size > 8 ? ` (+${policy.allowed.size - 8} more)` : "";
-				currentResult.errorMessage = `Model "${model}" is not in allowlist (${policy?.configPath}). Allowed: ${allowedPreview}${extra}. Killed child to enforce policy.`;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "session" && event.id) {
-					currentResult.sessionId = event.id;
-					// The child writes its JSONL at session start, so the path is
-					// available immediately \u2014 surface it live (for the human) and so it
-					// is already attached if the run is aborted mid-flight.
-					if (!resumePath) resolveSessionFile(sessionDir, currentResult);
-					emitUpdate();
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						const reportedModel = msg.model as string | undefined;
-						const reportedProvider = (msg as any).provider as string | undefined;
-						if (reportedModel) {
-							const canonicalModel = policy?.enabled
-								? resolveReportedModelId(reportedModel, reportedProvider, policy)
-								: undefined;
-							if (!currentResult.model) currentResult.model = canonicalModel ?? reportedModel;
-							if (policy?.enabled && !canonicalModel) blockForPolicy(reportedModel);
-						}
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (timeoutTimer) clearTimeout(timeoutTimer);
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				if (timeoutTimer) clearTimeout(timeoutTimer);
-				resolve(1);
-			});
-
-			if (opts?.timeoutMs && opts.timeoutMs > 0) {
-				timeoutTimer = setTimeout(() => killProc(true), opts.timeoutMs);
-			}
-
-			if (signal) {
-				const onAbort = () => killProc(false);
-				if (signal.aborted) onAbort();
-				else signal.addEventListener("abort", onAbort, { once: true });
-			}
-		});
-
-		currentResult.exitCode = exitCode;
-		// Resolve the persisted session file path (fallback if the start event was missed).
-		if (!resumePath) resolveSessionFile(sessionDir, currentResult);
-		// Abort/timeout no longer throw: return the partial result so completed work
-		// is never discarded and the session path stays inspectable/resumable.
-		if (wasPolicyBlocked) currentResult.stopReason = "policy-blocked";
-		else if (wasTimeout) currentResult.stopReason = "timeout";
-		else if (wasAborted) currentResult.stopReason = "aborted";
-		return currentResult;
-	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
-	}
+function addUsage(total: UsageStats, usage: Usage): void {
+	total.input += usage.input || 0;
+	total.output += usage.output || 0;
+	total.cacheRead += usage.cacheRead || 0;
+	total.cacheWrite += usage.cacheWrite || 0;
+	total.totalTokens = usage.totalTokens || total.totalTokens;
+	total.cost.input += usage.cost?.input || 0;
+	total.cost.output += usage.cost?.output || 0;
+	total.cost.cacheRead += usage.cost?.cacheRead || 0;
+	total.cost.cacheWrite += usage.cost?.cacheWrite || 0;
+	total.cost.total += usage.cost?.total || 0;
 }
 
-// Shared param-description fragments: single source of truth, composed per
-// schema below. Avoids the copy/paste drift that let a stale field name
-// (`stopReason=timeout`, which is never actually in the model-facing envelope
-// — the envelope key is `status=`) survive identically in three places.
-const DESC = {
-	task: "Task for the child. With `resume`, this becomes the steering prompt for the saved session.",
-	label: "Correlation label echoed in the result envelope (e.g. repo/feature name).",
-	agent: "Optional named agent. If omitted, runs inline.",
-	systemPrompt:
-		"Inline system prompt, appended to the child's base prompt. Ignored if `agent` is set (the named agent's own prompt is used instead).",
-	model:
-		"Exact model id for a fresh run. If the allowlist is enabled, use an id returned by `listModels`; aliases and provider-less names may be rejected. Omit to use the configured default.",
-	thinking: "Thinking level for a fresh run. Must be permitted for the selected model when the allowlist is enabled.",
-	tools: "Tool allowlist, e.g. ['read','grep','bash']. Omit to use the harness's default toolset.",
-	cwd: "Working directory for the agent process. Defaults to the current session's cwd.",
-	resume:
-		"Exact session JSONL path from a previous result's `session` field. The task is appended as a steering prompt. Fresh-run options are ignored; the saved session supplies its runtime configuration.",
-	timeoutMs: "Kill the child after this many ms and return partial output (status=timeout). No default.",
-} as const;
+function getFinalOutput(result: SubagentResult): string {
+	for (let i = result.messages.length - 1; i >= 0; i--) {
+		const message = result.messages[i];
+		if (message.role !== "assistant") continue;
+		const text = message.content
+			.filter((part) => part.type === "text")
+			.map((part) => part.text)
+			.join("\n")
+			.trim();
+		if (text) return text;
+	}
+	return result.partialText.trim();
+}
 
-const TaskItem = Type.Object({
-	task: Type.String({ description: DESC.task }),
-	label: Type.Optional(Type.String({ description: DESC.label })),
-	agent: Type.Optional(Type.String({ description: DESC.agent })),
-	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
-	model: Type.Optional(Type.String({ description: DESC.model })),
-	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
-	resume: Type.Optional(Type.String({ description: DESC.resume })),
-	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
-});
+function statusOf(result: SubagentResult): "running" | "done" | "failed" | "timeout" | "aborted" {
+	if (result.exitCode === -1) return "running";
+	if (result.stopReason === "timeout") return "timeout";
+	if (result.stopReason === "aborted") return "aborted";
+	if (result.exitCode !== 0 || result.stopReason === "error") return "failed";
+	return "done";
+}
 
-const ChainItem = Type.Object({
-	task: Type.String({
-		description: `Task with optional {previous} placeholder for prior output. ${DESC.task}`,
-	}),
-	label: Type.Optional(Type.String({ description: DESC.label })),
-	agent: Type.Optional(Type.String({ description: DESC.agent })),
-	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
-	model: Type.Optional(Type.String({ description: DESC.model })),
-	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	cwd: Type.Optional(Type.String({ description: DESC.cwd })),
-	resume: Type.Optional(Type.String({ description: DESC.resume })),
-	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
-});
+function resultOutput(result: SubagentResult): string {
+	const parts: string[] = [];
+	if (result.errorMessage) parts.push(`Error: ${result.errorMessage}`);
+	const output = getFinalOutput(result);
+	if (output) parts.push(output);
+	else if (result.stderr.trim()) parts.push(result.stderr.trim());
+	return parts.join("\n\n") || "(no output)";
+}
 
-const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
-	default: "user",
-});
+function truncateResult(output: string): string {
+	const truncated = truncateHead(output, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+	if (!truncated.truncated) return output;
+	return `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines, ${truncated.outputBytes} of ${truncated.totalBytes} bytes. Full output is available in the child session.]`;
+}
+
+function envelope(result: SubagentResult): string {
+	const fields: string[] = [];
+	if (result.label) fields.push(`label=${result.label}`);
+	fields.push(`status=${statusOf(result)}`);
+	if (result.resumed) fields.push("resumed=true");
+	if (result.model) fields.push(`model=${result.model}`);
+	if (result.thinking) fields.push(`thinking=${result.thinking}`);
+	if (result.timeoutMs) fields.push(`timeoutMs=${result.timeoutMs}`);
+	if (result.usage.turns) fields.push(`turns=${result.usage.turns}`);
+	if (result.usage.cost.total) fields.push(`cost=${result.usage.cost.total.toFixed(4)}`);
+	fields.push(`exit=${result.stopReason ?? "end"}`);
+	if (result.sessionFile) fields.push(`session=${result.sessionFile}`);
+	return `[${fields.join(" ")}]`;
+}
+
+function modelFacingResult(result: SubagentResult): string {
+	return `${envelope(result)}\n${truncateResult(resultOutput(result))}`;
+}
+
+function killChild(proc: ChildProcess): void {
+	if (proc.exitCode !== null || proc.signalCode !== null) return;
+	if (process.platform === "win32" && proc.pid) {
+		const killer = spawn("taskkill.exe", ["/pid", String(proc.pid), "/t", "/f"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		killer.on("error", () => proc.kill());
+		killer.on("close", (code) => {
+			if (code !== 0 && proc.exitCode === null && proc.signalCode === null) proc.kill();
+		});
+		killer.unref();
+		return;
+	}
+	proc.kill("SIGTERM");
+	setTimeout(() => {
+		if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+	}, 5000).unref();
+}
+
+type Update = (partial: AgentToolResult<SubagentDetails>) => void;
+
+interface RunChildDependencies {
+	agentDir?: string;
+	invoke?: (args: string[]) => { command: string; args: string[] };
+}
+
+async function runChild(
+	config: RunConfig,
+	task: string,
+	label: string | undefined,
+	timeoutMs: number | undefined,
+	resumePath: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: Update | undefined,
+	dependencies: RunChildDependencies = {},
+): Promise<SubagentResult> {
+	const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	const sessionDir = path.join(dependencies.agentDir ?? getAgentDir(), "sessions", "subagent", runId);
+	if (!resumePath) await fs.promises.mkdir(sessionDir, { recursive: true });
+
+	const args = ["--mode", "json", "-p"];
+	if (resumePath) args.push("--session", resumePath);
+	else args.push("--session-dir", sessionDir);
+	if (config.model) args.push("--model", config.model);
+	if (config.thinking) args.push("--thinking", config.thinking);
+	if (config.tools.length === 0) args.push("--no-tools");
+	else args.push("--tools", config.tools.join(","));
+	if (config.tools.some((tool) => INTERNAL_TOOL_NAMES.has(tool))) {
+		args.push("--extension", path.join(import.meta.dirname, "index.ts"));
+	}
+	args.push("--append-system-prompt", CHILD_SYSTEM_GUIDANCE);
+
+	const result: SubagentResult = {
+		task,
+		label,
+		resumed: Boolean(resumePath),
+		timeoutMs,
+		exitCode: -1,
+		messages: [],
+		toolActivity: [],
+		partialText: "",
+		stderr: "",
+		usage: EMPTY_USAGE(),
+		model: config.model,
+		thinking: config.thinking,
+		sessionFile: resumePath,
+	};
+
+	const emitUpdate = () => {
+		onUpdate?.({
+			content: [{ type: "text", text: result.partialText || getFinalOutput(result) || "(running...)" }],
+			details: { result },
+		});
+	};
+
+	let aborted = false;
+	let timedOut = false;
+	let currentTurnUsage: Usage | undefined;
+
+	const exitCode = await new Promise<number>((resolve) => {
+		const invocation = (dependencies.invoke ?? getPiInvocation)(args);
+		const proc = spawn(invocation.command, invocation.args, {
+			cwd: config.cwd,
+			shell: false,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let buffer = "";
+		const decoder = new StringDecoder("utf8");
+		let settled = false;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+
+		const finish = (code: number) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			if (signal) signal.removeEventListener("abort", onAbort);
+			resolve(code);
+		};
+		const onAbort = () => {
+			if (timedOut) return;
+			aborted = true;
+			if (timeout) clearTimeout(timeout);
+			killChild(proc);
+		};
+		const processLine = (line: string) => {
+			if (!line.trim()) return;
+			let event: any;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				return;
+			}
+
+			if (event.type === "session" && event.id) {
+				result.sessionId = event.id;
+				if (!resumePath) resolveSessionFile(sessionDir, result);
+				emitUpdate();
+				return;
+			}
+			if (event.type === "message_start" && event.message?.role === "assistant") {
+				result.partialText = "";
+				currentTurnUsage = undefined;
+				result.usage.turns++;
+				return;
+			}
+			if (event.type === "message_update") {
+				if (event.usage) currentTurnUsage = event.usage as Usage;
+				const delta = event.assistantMessageEvent;
+				if (delta?.type === "text_delta" && typeof delta.delta === "string") {
+					result.partialText += delta.delta;
+					emitUpdate();
+				}
+				return;
+			}
+			if (event.type === "tool_execution_start") {
+				result.toolActivity.push({
+					id: String(event.toolCallId ?? ""),
+					name: String(event.toolName ?? "unknown"),
+					args: event.args && typeof event.args === "object" ? event.args : {},
+					status: "running",
+				});
+				emitUpdate();
+				return;
+			}
+			if (event.type === "tool_execution_end") {
+				const activity = result.toolActivity.find((item) => item.id === String(event.toolCallId ?? ""));
+				if (activity) activity.status = event.isError ? "error" : "done";
+				emitUpdate();
+				return;
+			}
+			if (event.type === "message_end" && event.message) {
+				const message = event.message as Message;
+				result.messages.push(message);
+				if (message.role === "assistant") {
+					result.partialText = "";
+					currentTurnUsage = undefined;
+					if (message.usage) addUsage(result.usage, message.usage);
+					const reportedModel = message.model as string | undefined;
+					const provider = (message as any).provider as string | undefined;
+					if (reportedModel && !config.model) {
+						result.model = provider ? `${provider}/${reportedModel}` : reportedModel;
+						config.model = result.model;
+					}
+					if (message.stopReason) result.stopReason = message.stopReason;
+					if (message.errorMessage) result.errorMessage = message.errorMessage;
+				}
+				emitUpdate();
+				return;
+			}
+		};
+
+		proc.stdin?.on("error", () => {});
+		proc.stdin?.end(task);
+		proc.stdout?.on("data", (data) => {
+			buffer += decoder.write(data);
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+			for (const line of lines) processLine(line);
+		});
+		proc.stderr?.on("data", (data) => {
+			result.stderr += data.toString();
+		});
+		proc.on("close", (code) => {
+			buffer += decoder.end();
+			if (buffer.trim()) processLine(buffer);
+			finish(code ?? 0);
+		});
+		proc.on("error", (error) => {
+			result.errorMessage = error.message;
+			finish(1);
+		});
+
+		if (timeoutMs) {
+			timeout = setTimeout(() => {
+				if (aborted) return;
+				timedOut = true;
+				killChild(proc);
+			}, timeoutMs);
+		}
+		if (signal) {
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+		}
+	});
+
+	result.exitCode = exitCode;
+	if (currentTurnUsage) addUsage(result.usage, currentTurnUsage);
+	if (!resumePath) {
+		resolveSessionFile(sessionDir, result);
+		if (!result.sessionFile) {
+			result.errorMessage = "Child session was not created; this run cannot be resumed.";
+			if (!timedOut && !aborted) result.exitCode = 1;
+		} else {
+			try {
+				writeChildMetadata(result.sessionFile, {
+					version: 2,
+					cwd: config.cwd,
+					model: config.model,
+					thinking: config.thinking,
+					tools: config.tools,
+				});
+			} catch (error) {
+				result.errorMessage = `Child finished, but resume metadata could not be saved: ${error instanceof Error ? error.message : String(error)}`;
+				if (!timedOut && !aborted) result.exitCode = 1;
+			}
+		}
+	}
+	if (timedOut) result.stopReason = "timeout";
+	else if (aborted) result.stopReason = "aborted";
+	return result;
+}
+
+function formatTokens(count: number): string {
+	if (count < 1000) return String(count);
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	return `${(count / 1000000).toFixed(1)}M`;
+}
+
+function usageText(result: SubagentResult): string {
+	const parts: string[] = [];
+	if (result.usage.turns) parts.push(`${result.usage.turns} turn${result.usage.turns === 1 ? "" : "s"}`);
+	if (result.usage.input) parts.push(`↑${formatTokens(result.usage.input)}`);
+	if (result.usage.output) parts.push(`↓${formatTokens(result.usage.output)}`);
+	if (result.usage.cacheRead) parts.push(`R${formatTokens(result.usage.cacheRead)}`);
+	if (result.usage.cacheWrite) parts.push(`W${formatTokens(result.usage.cacheWrite)}`);
+	if (result.usage.cost.total) parts.push(`$${result.usage.cost.total.toFixed(4)}`);
+	if (result.usage.totalTokens) parts.push(`ctx:${formatTokens(result.usage.totalTokens)}`);
+	if (result.model) parts.push(result.model);
+	if (result.thinking) parts.push(result.thinking);
+	return parts.join(" ");
+}
+
+type DisplayItem =
+	| { type: "text"; text: string }
+	| { type: "toolCall"; name: string; args: Record<string, unknown> }
+	| { type: "toolResult"; name: string; text: string; isError: boolean };
+
+function displayItems(result: SubagentResult): DisplayItem[] {
+	const items: DisplayItem[] = [];
+	for (const message of result.messages) {
+		if (message.role === "assistant") {
+			for (const part of message.content) {
+				if (part.type === "text" && part.text.trim()) items.push({ type: "text", text: part.text });
+				if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+			}
+		} else if (message.role === "toolResult") {
+			const text = message.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			items.push({ type: "toolResult", name: message.toolName, text, isError: message.isError });
+		}
+	}
+	if (result.partialText) items.push({ type: "text", text: result.partialText });
+	return items;
+}
+
+function formatToolCall(name: string, args: Record<string, unknown>): string {
+	if (name === "bash" && typeof args.command === "string") return `$ ${args.command.split("\n")[0]}`;
+	const target = args.path ?? args.pattern ?? args.query;
+	return target === undefined ? name : `${name} ${String(target)}`;
+}
+
+function compactItem(item: DisplayItem): string {
+	if (item.type === "toolCall") return `→ ${formatToolCall(item.name, item.args)}`;
+	if (item.type === "toolResult") {
+		const first = item.text.trim().split("\n")[0] || "(no output)";
+		return `← ${item.name}${item.isError ? " failed" : ""}: ${first.slice(0, 160)}`;
+	}
+	return item.text.split("\n").slice(0, 3).join("\n");
+}
 
 const SubagentParams = Type.Object({
-	task: Type.Optional(Type.String({ description: `${DESC.task} (single mode)` })),
-	label: Type.Optional(Type.String({ description: DESC.label })),
-	agent: Type.Optional(Type.String({ description: DESC.agent })),
-	systemPrompt: Type.Optional(Type.String({ description: DESC.systemPrompt })),
-	model: Type.Optional(Type.String({ description: DESC.model })),
-	thinking: Type.Optional(Type.String({ description: DESC.thinking })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: DESC.tools })),
-	resume: Type.Optional(Type.String({ description: DESC.resume })),
-	timeoutMs: Type.Optional(Type.Number({ description: DESC.timeoutMs })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of tasks for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of steps for sequential execution" })),
-	listModels: Type.Optional(
-		Type.Boolean({ description: "Show exact allowed model ids, thinking levels, benchmark summaries, default, and validation errors. No subagent is spawned." }),
-	),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
-	),
-	cwd: Type.Optional(Type.String({ description: `${DESC.cwd} (single mode)` })),
+	task: Type.String({ minLength: 1, description: "Self-contained task for a fresh child, or the next direction for a resumed child." }),
+	label: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$", description: "Short correlation label echoed in the result." })),
+	model: Type.Optional(Type.String({ minLength: 1, description: "Pi model pattern or provider/id for a fresh child. With model policy enabled, use an exact id from subagent_models." })),
+	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Thinking level for a fresh child." })),
+	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Tool allowlist for a fresh child. Include subagent explicitly to permit recursive delegation." })),
+	cwd: Type.Optional(Type.String({ minLength: 1, description: "Working directory for a fresh child. Defaults to the parent cwd." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Review horizon in milliseconds. Returns partial work and a resumable session on expiry." })),
+	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call." })),
 });
+
+const SUBAGENT_GUIDELINES = [
+	"Use subagent for focused work that benefits from an isolated context; give it a self-contained task with relevant constraints and the desired output.",
+	"Issue multiple independent subagent calls in one response to run them concurrently through Pi; avoid overlapping file edits.",
+	"Choose the narrowest subagent tools set that can complete the task, and grant the subagent tool itself only when recursive delegation is genuinely needed.",
+	"Use subagent timeoutMs as the next supervision point for longer work, not only as a hang guard.",
+	"A subagent is instructed to return when it needs clarification or a decision; answer by resuming its session with the required direction.",
+	"Prefer resuming a useful subagent session over starting again; after a timeout, resume it for a concise state assessment before deciding the next direction.",
+	"Call subagent_models once when child model choice matters and reuse its compact catalog for later delegations.",
+];
+
+export const __testing = {
+	allowedThinkingLevels,
+	compactModelCatalog,
+	envelope,
+	loadModelPolicy,
+	metadataPath,
+	modelFacingResult,
+	readChildMetadata,
+	resolveFreshModel,
+	runChild,
+	statusOf,
+	validateModelPolicy,
+	writeChildMetadata,
+};
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
+		name: "subagent_models",
+		label: "Subagent Models",
+		description: "Return the configured child-model allowlist, permitted thinking levels, optional benchmarks, and default. No child is started.",
+		promptSnippet: "Inspect the curated child-model catalog when model choice matters",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const { policy, error } = loadModelPolicy();
+			if (error) throw new Error(error);
+			const validationErrors = validateModelPolicy(policy, ctx.modelRegistry);
+			const catalog = compactModelCatalog(policy, validationErrors);
+			return {
+				content: [{ type: "text", text: JSON.stringify(catalog) }],
+				details: catalog,
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: [
-			"Delegate work to an isolated child pi process.",
-			"Use `task` for one run, `tasks` for parallel runs, or `chain` for sequential runs.",
-			"Use `resume` with a previous session path to continue existing work.",
-			"Use `listModels: true` to discover exact allowed model ids and thinking levels.",
-		].join(" "),
+		description: "Run one synchronous, isolated, observable child Pi task. The result includes a persisted session path that can be resumed with new direction.",
+		promptSnippet: "Delegate one focused task to an isolated, observable, resumable Pi session",
+		promptGuidelines: SUBAGENT_GUIDELINES,
 		parameters: SubagentParams,
-
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
-			const agents = discovery.agents;
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
-			const { policy: modelPolicy, error: modelPolicyError } = loadModelPolicy();
-			const validationErrors = modelPolicyError ? [] : validateModelPolicy(modelPolicy, ctx.modelRegistry);
+			if (!params.task.trim()) throw new Error("Subagent task must not be blank.");
+			const { policy, error: policyError } = loadModelPolicy();
+			if (policyError) throw new Error(policyError);
+			const validationErrors = validateModelPolicy(policy, ctx.modelRegistry);
+			if (validationErrors.length > 0) throw new Error(validationErrors.join("\n"));
 
-			if (params.listModels) {
-				const compactModels = compactModelList(modelPolicy);
-				const payload = {
-					allowlistEnabled: modelPolicy.enabled,
-					validationErrors,
-					levelsLegend: "Benchmark summary by allowed thinking level: AA <intelligence>/<coding>/$<cost>; DeepSWE <pass@1>/$<cost>.",
-					default: modelPolicy.defaultModel ?? null,
-					...compactModels,
-					configPath: modelPolicy.configPath,
-					note: modelPolicy.enabled
-						? "Set `model` to a row id; omit to use `default`."
-						: "Allowlist disabled: any harness model may be used; omitting `model` inherits the harness default.",
-				};
-				return {
-					content: [{ type: "text", text: JSON.stringify(payload) }],
-					details: {
-						mode: "single" as const,
-						agentScope,
-						projectAgentsDir: discovery.projectAgentsDir,
-						results: [],
-					},
-				};
-			}
-
-			const hasChain = (params.chain?.length ?? 0) > 0;
-			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-
-			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope,
-					projectAgentsDir: discovery.projectAgentsDir,
-					results,
-				});
-
-			if (modelPolicyError || validationErrors.length > 0) {
-				const errorText = [modelPolicyError, ...validationErrors].filter(Boolean).join("\n");
-				return {
-					content: [{ type: "text", text: errorText }],
-					details: makeDetails("single")([]),
-					isError: true,
-				};
-			}
-
-			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
-			}
-
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) if (step.agent) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) if (t.agent) requestedAgentNames.add(t.agent);
-				if (params.agent) requestedAgentNames.add(params.agent);
-
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
-
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						};
+			let resumePath: string | undefined;
+			let config: RunConfig;
+			if (params.resume) {
+				if (params.model || params.thinking || params.tools || params.cwd) {
+					throw new Error("A resumed subagent accepts only task, resume, label, and timeoutMs. Start a fresh child to change runtime configuration.");
 				}
-			}
-
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					if (signal?.aborted) {
-						results.push(neverStartedResult(step.agent ?? "inline", "unknown", taskWithContext, step.label, i + 1));
-						break;
-					}
-
-					const { spec, opts, error } = resolveRunPlan(agents, { ...step, task: taskWithContext }, modelPolicy);
-					if (error || !spec) {
-						results.push(failedSpecResult(step.resume ? "resume" : (step.agent ?? "inline"), taskWithContext, i + 1, error ?? "resolve failed"));
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1}: ${error ?? "resolve failed"}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						spec,
-						taskWithContext,
-						opts.resume ? undefined : step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-						opts,
-						modelPolicy,
-					);
-					results.push(result);
-
-					if (isFailedResult(result)) {
-						// Flush every completed step's block, not just the failing one.
-						const blocks = results.map(buildTaskBlock).join("\n\n---\n\n");
-						const header = `chain stopped at step ${i + 1} (${statusOf(result)}) \u00b7 ${tallyStatuses(results)}`;
-						return {
-							content: [{ type: "text", text: `${header}\n\n${blocks}${unfinishedNote(results)}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
+				resumePath = resolveResumePath(params.resume);
+				const saved = readChildMetadata(resumePath);
+				if (policy.enabled && !saved.model) {
+					throw new Error("The resumed session does not record a verifiable model. Start a fresh child using the current model policy.");
 				}
-				const last = results[results.length - 1];
-				return {
-					content: [{ type: "text", text: buildTaskBlock(last) }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].resume ? "resume" : (params.tasks[i].agent ?? "inline"),
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						label: params.tasks[i].label,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
+				if (policy.enabled && saved.model && !policy.allowed.has(saved.model)) {
+					throw new Error(`The resumed session uses model "${saved.model}", which is no longer permitted.`);
 				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					if (signal?.aborted) {
-						const ns = neverStartedResult(t.resume ? "resume" : (t.agent ?? "inline"), "unknown", t.task, t.label, undefined);
-						allResults[index] = ns;
-						emitParallelUpdate();
-						return ns;
-					}
-					const { spec, opts, error } = resolveRunPlan(agents, t, modelPolicy);
-					if (error || !spec) {
-						const failed = failedSpecResult(t.resume ? "resume" : (t.agent ?? "inline"), t.task, undefined, error ?? "resolve failed");
-						failed.label = t.label;
-						allResults[index] = failed;
-						emitParallelUpdate();
-						return failed;
-					}
-					const result = await runSingleAgent(
-						ctx.cwd,
-						spec,
-						t.task,
-						opts.resume ? undefined : t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-						opts,
-						modelPolicy,
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const blocks = results.map(buildTaskBlock);
-				const header = `subagent parallel \u00b7 ${tallyStatuses(results)} (of ${results.length})`;
-				return {
-					content: [
-						{
-							type: "text",
-							text: `${header}\n\n${blocks.join("\n\n---\n\n")}${unfinishedNote(results)}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
-					isError: successCount === 0,
-				};
-			}
-
-			if (params.task) {
-				const { spec, opts, error } = resolveRunPlan(agents, params as RunItem, modelPolicy);
-				if (error || !spec) {
-					const failed = failedSpecResult(params.resume ? "resume" : (params.agent ?? "inline"), params.task, undefined, error ?? "resolve failed");
-					failed.label = params.label;
-					return {
-						content: [{ type: "text", text: error ?? "resolve failed" }],
-						details: makeDetails("single")([failed]),
-						isError: true,
-					};
+				const levels = saved.model ? allowedThinkingLevels(policy.metadata.get(saved.model)) : undefined;
+				if (policy.enabled && levels && !saved.thinking) {
+					throw new Error(`The resumed session does not record a thinking level required by the current policy for "${saved.model}".`);
 				}
-				const result = await runSingleAgent(
-					ctx.cwd,
-					spec,
-					params.task,
-					params.resume ? undefined : params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-					opts,
-					modelPolicy,
-				);
-				return {
-					content: [{ type: "text", text: buildTaskBlock(result) }],
-					details: makeDetails("single")([result]),
-					isError: isFailedResult(result),
+				if (policy.enabled && saved.thinking && levels && !levels.includes(saved.thinking)) {
+					throw new Error(`The resumed session uses thinking level "${saved.thinking}", which is no longer permitted for "${saved.model}".`);
+				}
+				config = saved;
+			} else {
+				const selected = resolveFreshModel(params.model, params.thinking, policy);
+				if (selected.error) throw new Error(selected.error);
+				const inheritedTools = pi.getActiveTools().filter((name) => !INTERNAL_TOOL_NAMES.has(name));
+				config = {
+					cwd: path.resolve(params.cwd ?? ctx.cwd),
+					model: selected.model,
+					thinking: params.thinking,
+					tools: params.tools ? [...new Set(params.tools)] : inheritedTools,
 				};
 			}
 
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			const result = await runChild(
+				config,
+				params.task,
+				params.label,
+				params.timeoutMs,
+				resumePath,
+				signal,
+				onUpdate,
+			);
 			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single")([]),
+				content: [{ type: "text", text: modelFacingResult(result) }],
+				details: { result },
+				usage: result.usage,
 			};
 		},
-
-		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent ?? "inline") +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent ?? "inline")}${theme.fg("dim", ` ${preview}`)}`;
-				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			const agentName = args.agent || "inline";
-			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-			let text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
-			text += `\n  ${theme.fg("dim", preview)}`;
-			return new Text(text, 0, 0);
+		renderCall(args, theme) {
+			const preview = args.task.length > 72 ? `${args.task.slice(0, 72)}…` : args.task;
+			const identity = args.label ?? (args.resume ? "resume" : "child");
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", identity)}\n  ${theme.fg("dim", preview)}`,
+				0,
+				0,
+			);
 		},
-
-		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SubagentDetails | undefined;
-			if (!details || details.results.length === 0) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		renderResult(toolResult, { expanded }, theme) {
+			const details = toolResult.details as SubagentDetails | undefined;
+			if (!details?.result) {
+				const content = toolResult.content[0];
+				return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
 			}
+			const result = details.result;
+			const status = statusOf(result);
+			const success = status === "done";
+			const icon = status === "running"
+				? theme.fg("warning", "⏳")
+				: success
+					? theme.fg("success", "✓")
+					: theme.fg(status === "timeout" ? "warning" : "error", "✗");
+			const title = result.label ?? (result.resumed ? "resumed child" : "child");
+			const items = displayItems(result);
 
-			const mdTheme = getMarkdownTheme();
-
-			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
-				const toShow = limit ? items.slice(-limit) : items;
-				const skipped = limit && items.length > limit ? items.length - limit : 0;
-				let text = "";
-				if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-				for (const item of toShow) {
-					if (item.type === "text") {
-						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-						text += `${theme.fg("toolOutput", preview)}\n`;
-					} else {
-						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
-					}
+			if (!expanded) {
+				const recent = items.slice(-COLLAPSED_ITEM_COUNT);
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold(title))} ${theme.fg(success ? "success" : "warning", status)}`;
+				if (items.length > recent.length) text += `\n${theme.fg("muted", `… ${items.length - recent.length} earlier items`)}`;
+				for (const item of recent) text += `\n${theme.fg(item.type === "toolResult" && item.isError ? "error" : "dim", compactItem(item))}`;
+				for (const activity of result.toolActivity.filter((item) => item.status === "running")) {
+					text += `\n${theme.fg("warning", `⚙ ${formatToolCall(activity.name, activity.args)}`)}`;
 				}
-				return text.trimEnd();
-			};
-
-			if (details.mode === "single" && details.results.length === 1) {
-				const r = details.results[0];
-				const isError = isFailedResult(r);
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const displayItems = getDisplayItems(r.messages);
-				const finalOutput = getFinalOutput(r.messages);
-
-				if (expanded) {
-					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
-					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
-					} else {
-						for (const item of displayItems) {
-							if (item.type === "toolCall")
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-						}
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-					}
-					const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
-					}
-					if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
-					return container;
-				}
-
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				}
-				const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
+				const stats = usageText(result);
+				if (stats) text += `\n${theme.fg("dim", stats)}`;
+				if (result.sessionFile) text += `\n${theme.fg("dim", `session: ${result.sessionFile}`)}`;
 				return new Text(text, 0, 0);
 			}
 
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
-			};
-
-			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
-
-				if (expanded) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							icon +
-								" " +
-								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(
-								`${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`,
-								0,
-								0,
-							),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const stepUsage = formatUsageStats(r.usage, r.model, r.thinking);
-						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
-						if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view
-				let text =
-					icon +
-					" " +
-					theme.fg("toolTitle", theme.bold("chain ")) +
-					theme.fg("accent", `${successCount}/${details.results.length} steps`);
-				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-					if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
-				}
-				const usageStr = formatUsageStats(aggregateUsage(details.results));
-				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
+			const container = new Container();
+			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(title))} ${theme.fg(success ? "success" : "warning", status)}`, 0, 0));
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(theme.fg("muted", "── Task ──"), 0, 0));
+			container.addChild(new Text(result.task, 0, 0));
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(theme.fg("muted", "── Activity ──"), 0, 0));
+			for (const item of items) {
+				if (item.type === "text") continue;
+				container.addChild(new Text(theme.fg(item.type === "toolResult" && item.isError ? "error" : "dim", compactItem(item)), 0, 0));
 			}
-
-			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
-				const isRunning = running > 0;
-				const icon = isRunning
-					? theme.fg("warning", "⏳")
-					: failCount > 0
-						? theme.fg("warning", "◐")
-						: theme.fg("success", "✓");
-				const status = isRunning
-					? `${successCount + failCount}/${details.results.length} done, ${running} running`
-					: `${successCount}/${details.results.length} tasks`;
-
-				if (expanded && !isRunning) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
-						const displayItems = getDisplayItems(r.messages);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-						}
-
-						const taskUsage = formatUsageStats(r.usage, r.model, r.thinking);
-						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
-						if (r.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${r.sessionFile}`), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed view (or still running)
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "⏳")
-							: isFailedResult(r)
-								? theme.fg("error", "✗")
-								: theme.fg("success", "✓");
-					const displayItems = getDisplayItems(r.messages);
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
-					else text += `\n${renderDisplayItems(displayItems, 5)}`;
-					if (r.sessionFile) text += `\n${theme.fg("dim", `session: ${r.sessionFile}`)}`;
-				}
-				if (!isRunning) {
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
-				}
-				if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-				return new Text(text, 0, 0);
-			}
-
-			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(theme.fg("muted", "── Result ──"), 0, 0));
+			container.addChild(new Markdown(resultOutput(result), 0, 0, getMarkdownTheme()));
+			const stats = usageText(result);
+			if (stats) container.addChild(new Text(theme.fg("dim", stats), 0, 0));
+			if (result.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${result.sessionFile}`), 0, 0));
+			return container;
 		},
 	});
 }
