@@ -7,8 +7,9 @@
         "high": {},
         "xhigh": {}
       },
-      "description": "Why this model is allowed"
+      "description": "hints about this model and thinking levels"
     }
   ],
-  "default": "provider/model-id"
+  "default": "provider/model-id",
+  "defaultThinking": "high"
 }
