@@ -3,8 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { StringEnum, type Message, type Usage } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { getSupportedThinkingLevels, StringEnum, type Message, type Model, type Usage } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -21,7 +21,7 @@ const CHILD_SYSTEM_GUIDANCE =
 const COLLAPSED_ITEM_COUNT = 10;
 const CHILD_METADATA_SUFFIX = ".subagent.json";
 const INTERNAL_TOOL_NAMES = new Set(["subagent", "subagent_models"]);
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ThinkingLevel[];
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
 
 interface UsageStats extends Usage {
@@ -179,11 +179,26 @@ function allowedThinkingLevels(entry: ModelAllowlistEntry | undefined): string[]
 	return levels.length > 0 ? levels : undefined;
 }
 
-function validateModelPolicy(policy: ModelPolicy, registry: { getAll(): any[] }): string[] {
+interface ModelRegistryView {
+	getAll(): Model<any>[];
+}
+
+function modelMap(registry: ModelRegistryView): Map<string, Model<any>> {
+	return new Map(registry.getAll().map((model) => [`${model.provider}/${model.id}`, model]));
+}
+
+function effectiveThinkingLevels(entry: ModelAllowlistEntry | undefined, model: Model<any>): ThinkingLevel[] {
+	const supported = getSupportedThinkingLevels(model) as ThinkingLevel[];
+	const configured = allowedThinkingLevels(entry);
+	return configured
+		? supported.filter((level) => configured.includes(level))
+		: supported;
+}
+
+function validateModelPolicy(policy: ModelPolicy, registry: ModelRegistryView): string[] {
 	if (!policy.enabled) return [];
 	const errors: string[] = [];
-	const known = new Map<string, any>();
-	for (const model of registry.getAll()) known.set(`${model.provider}/${model.id}`, model);
+	const known = modelMap(registry);
 
 	for (const id of policy.allowed) {
 		const model = known.get(id);
@@ -191,20 +206,11 @@ function validateModelPolicy(policy: ModelPolicy, registry: { getAll(): any[] })
 			errors.push(`Allowlisted model "${id}" is not known to Pi.`);
 			continue;
 		}
+		const supported = new Set<string>(getSupportedThinkingLevels(model));
 		for (const level of allowedThinkingLevels(policy.metadata.get(id)) ?? []) {
 			if (!THINKING_LEVEL_SET.has(level)) {
 				errors.push(`Thinking level "${level}" configured for "${id}" is not recognized by Pi.`);
-				continue;
-			}
-			if (level === "off") continue;
-			if (!model.reasoning) {
-				errors.push(`Thinking level "${level}" is unsupported by "${id}".`);
-				continue;
-			}
-			const map = model.thinkingLevelMap as Record<string, unknown> | undefined;
-			if ((level === "xhigh" || level === "max") && (!map || !(level in map) || map[level] === null)) {
-				errors.push(`Thinking level "${level}" is unsupported by "${id}".`);
-			} else if (map && level in map && map[level] === null) {
+			} else if (!supported.has(level)) {
 				errors.push(`Thinking level "${level}" is unsupported by "${id}".`);
 			}
 		}
@@ -216,6 +222,7 @@ function resolveFreshModel(
 	requestedModel: string | undefined,
 	thinking: string | undefined,
 	policy: ModelPolicy,
+	registry?: ModelRegistryView,
 ): { model?: string; error?: string } {
 	if (!policy.enabled) return { model: requestedModel?.trim() || undefined };
 	const model = requestedModel?.trim() || policy.defaultModel;
@@ -223,22 +230,27 @@ function resolveFreshModel(
 	if (!policy.allowed.has(model)) {
 		return { error: `Model "${model}" is not allowed. Call subagent_models for permitted models.` };
 	}
-	const levels = allowedThinkingLevels(policy.metadata.get(model));
-	if (!thinking && levels) {
-		return { error: `Thinking level is required for "${model}". Allowed: ${levels.join(", ")}.` };
+	const entry = policy.metadata.get(model);
+	const configuredLevels = allowedThinkingLevels(entry);
+	const knownModel = registry ? modelMap(registry).get(model) : undefined;
+	const levels = knownModel ? effectiveThinkingLevels(entry, knownModel) : configuredLevels;
+	if (!thinking && configuredLevels) {
+		return { error: `Thinking level is required for "${model}". Allowed: ${levels?.join(", ") || "none"}.` };
 	}
 	if (thinking && levels && !levels.includes(thinking)) {
-		return { error: `Thinking level "${thinking}" is not allowed for "${model}". Allowed: ${levels.join(", ")}.` };
+		return { error: `Thinking level "${thinking}" is not allowed for "${model}". Allowed: ${levels.join(", ") || "none"}.` };
 	}
 	return { model };
 }
 
-function formatLevels(levels: unknown): string {
-	if (!levels || typeof levels !== "object" || Array.isArray(levels)) return "";
-	return Object.entries(levels as Record<string, ModelAllowlistLevel>)
-		.map(([level, value]) => {
+function formatLevels(levels: ThinkingLevel[], metadata: unknown): string {
+	const values = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+		? metadata as Record<string, ModelAllowlistLevel>
+		: {};
+	return levels
+		.map((level) => {
 			const metrics: string[] = [];
-			const aa = value?.artificialAnalysis;
+			const aa = values[level]?.artificialAnalysis;
 			if (aa) {
 				const quality = [aa.intelligence, aa.coding]
 					.filter((metric): metric is number => typeof metric === "number")
@@ -246,7 +258,7 @@ function formatLevels(levels: unknown): string {
 					.join("/");
 				metrics.push(`AA ${quality || "?"}${typeof aa.cost === "number" ? `/$${aa.cost}` : ""}`);
 			}
-			const swe = value?.deepSWE;
+			const swe = values[level]?.deepSWE;
 			if (swe) {
 				const pass = typeof swe.pass === "number" ? `${Math.round(swe.pass * 100)}%` : "?";
 				metrics.push(`DeepSWE ${pass}${typeof swe.cost === "number" ? `/$${swe.cost}` : ""}`);
@@ -256,17 +268,22 @@ function formatLevels(levels: unknown): string {
 		.join(" · ");
 }
 
-function compactModelCatalog(policy: ModelPolicy, validationErrors: string[]) {
+function compactModelCatalog(policy: ModelPolicy, validationErrors: string[], registry: ModelRegistryView) {
+	const known = modelMap(registry);
 	const entries = Array.from(policy.allowed).map((id) => policy.metadata.get(id) ?? { id });
 	return {
 		allowlistEnabled: policy.enabled,
 		default: policy.defaultModel ?? null,
 		columns: ["id", "levels", "description"],
-		models: entries.map((entry) => [entry.id, formatLevels(entry.levels), entry.description ?? null]),
+		models: entries.map((entry) => {
+			const model = known.get(entry.id);
+			const levels = model ? effectiveThinkingLevels(entry, model) : [];
+			return [entry.id, formatLevels(levels, entry.levels), entry.description ?? null];
+		}),
 		validationErrors,
 		note: policy.enabled
-			? "Use an exact row id and an allowed thinking level. Omit model to use the default."
-			: "No allowlist is configured; omit model to use the child Pi default or provide any available Pi model.",
+			? "Use a row id as subagent.model and one of its levels as subagent.thinking. Omit model to use the default."
+			: "No allowlist is configured; omit subagent.model to use the child Pi default or provide any available Pi model.",
 	};
 }
 
@@ -410,13 +427,6 @@ function envelope(result: SubagentResult): string {
 	const fields: string[] = [];
 	if (result.label) fields.push(`label=${result.label}`);
 	fields.push(`status=${statusOf(result)}`);
-	if (result.resumed) fields.push("resumed=true");
-	if (result.model) fields.push(`model=${result.model}`);
-	if (result.thinking) fields.push(`thinking=${result.thinking}`);
-	if (result.timeoutMs) fields.push(`timeoutMs=${result.timeoutMs}`);
-	if (result.usage.turns) fields.push(`turns=${result.usage.turns}`);
-	if (result.usage.cost.total) fields.push(`cost=${result.usage.cost.total.toFixed(4)}`);
-	fields.push(`exit=${result.stopReason ?? "end"}`);
 	if (result.sessionFile) fields.push(`session=${result.sessionFile}`);
 	return `[${fields.join(" ")}]`;
 }
@@ -720,24 +730,21 @@ function compactItem(item: DisplayItem): string {
 }
 
 const SubagentParams = Type.Object({
-	task: Type.String({ minLength: 1, description: "Self-contained task for a fresh child, or the next direction for a resumed child." }),
-	label: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$", description: "Short correlation label echoed in the result." })),
-	model: Type.Optional(Type.String({ minLength: 1, description: "Pi model pattern or provider/id for a fresh child. With model policy enabled, use an exact id from subagent_models." })),
-	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Thinking level for a fresh child." })),
-	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Tool allowlist for a fresh child. Include subagent explicitly to permit recursive delegation." })),
+	task: Type.String({ minLength: 1, description: "Self-contained assignment for a fresh child, or the next instruction for a resumed child." }),
+	label: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$", description: "Short correlation label returned with the result." })),
+	model: Type.Optional(Type.String({ minLength: 1, description: "Fresh child only. Pi model pattern or provider/id. With child-model policy enabled, use an exact id from subagent_models; omit to use the policy default, or the child Pi default when policy is disabled." })),
+	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Fresh child only. Pi thinking level supported by the selected model and permitted by child-model policy. subagent_models lists the effective levels; omit to use the child Pi default unless policy requires a level." })),
+	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Fresh child only. Omit to inherit the parent's active tools except subagent and subagent_models; [] disables tools; a non-empty array is the child's exact tool set. Add subagent alongside any other required tools only when the child must delegate further." })),
 	cwd: Type.Optional(Type.String({ minLength: 1, description: "Working directory for a fresh child. Defaults to the parent cwd." })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Review horizon in milliseconds. Returns partial work and a resumable session on expiry." })),
-	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Supervision checkpoint in milliseconds. On expiry, stops the child and returns partial work with its resumable session when available." })),
+	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call. Cannot be combined with fresh-child model, thinking, tools, or cwd." })),
 });
 
 const SUBAGENT_GUIDELINES = [
-	"Use subagent for focused work that benefits from an isolated context; give it a self-contained task with relevant constraints and the desired output.",
-	"Issue multiple independent subagent calls in one response to run them concurrently through Pi; avoid overlapping file edits.",
-	"Choose the narrowest subagent tools set that can complete the task, and grant the subagent tool itself only when recursive delegation is genuinely needed.",
-	"Use subagent timeoutMs as the next supervision point for longer work, not only as a hang guard.",
-	"A subagent is instructed to return when it needs clarification or a decision; answer by resuming its session with the required direction.",
-	"Prefer resuming a useful subagent session over starting again; after a timeout, resume it for a concise state assessment before deciding the next direction.",
-	"Call subagent_models once when child model choice matters and reuse its compact catalog for later delegations.",
+	"Give subagent a self-contained task with relevant context, constraints, and the required output.",
+	"Issue independent subagent calls together to run them concurrently; partition write work so children do not edit the same files.",
+	"Treat subagent.timeoutMs as a supervision checkpoint, not merely a runtime limit; set it to when control should return for progress review. After a timeout, resume directly with direction when the child's state is clear; otherwise, resume for a concise state summary and then resume again with informed direction.",
+	"Prefer subagent.resume whenever the child's accumulated context remains useful, including for answers, corrections, or follow-up.",
 ];
 
 export const __testing = {
@@ -759,14 +766,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_models",
 		label: "Subagent Models",
-		description: "Return the configured child-model allowlist, permitted thinking levels, optional benchmarks, and default. No child is started.",
-		promptSnippet: "Inspect the curated child-model catalog when model choice matters",
+		description: "Return the model ids and model-supported thinking levels accepted by subagent under the configured child-model policy, with the default and optional benchmark notes. No child is started.",
+		promptSnippet: "List model and thinking values accepted by subagent",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const { policy, error } = loadModelPolicy();
 			if (error) throw new Error(error);
 			const validationErrors = validateModelPolicy(policy, ctx.modelRegistry);
-			const catalog = compactModelCatalog(policy, validationErrors);
+			const catalog = compactModelCatalog(policy, validationErrors, ctx.modelRegistry);
 			return {
 				content: [{ type: "text", text: JSON.stringify(catalog) }],
 				details: catalog,
@@ -777,8 +784,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: "Run one synchronous, isolated, observable child Pi task. The result includes a persisted session path that can be resumed with new direction.",
-		promptSnippet: "Delegate one focused task to an isolated, observable, resumable Pi session",
+		description: "Run one task in a separate Pi session and return its final or partial response with a session path that can be resumed.",
+		promptSnippet: "Run a task in a separate resumable Pi session",
 		promptGuidelines: SUBAGENT_GUIDELINES,
 		parameters: SubagentParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -802,16 +809,19 @@ export default function (pi: ExtensionAPI) {
 				if (policy.enabled && saved.model && !policy.allowed.has(saved.model)) {
 					throw new Error(`The resumed session uses model "${saved.model}", which is no longer permitted.`);
 				}
-				const levels = saved.model ? allowedThinkingLevels(policy.metadata.get(saved.model)) : undefined;
-				if (policy.enabled && levels && !saved.thinking) {
+				const entry = saved.model ? policy.metadata.get(saved.model) : undefined;
+				const configuredLevels = allowedThinkingLevels(entry);
+				const savedModel = saved.model ? modelMap(ctx.modelRegistry).get(saved.model) : undefined;
+				const effectiveLevels = savedModel ? effectiveThinkingLevels(entry, savedModel) : undefined;
+				if (policy.enabled && configuredLevels && !saved.thinking) {
 					throw new Error(`The resumed session does not record a thinking level required by the current policy for "${saved.model}".`);
 				}
-				if (policy.enabled && saved.thinking && levels && !levels.includes(saved.thinking)) {
-					throw new Error(`The resumed session uses thinking level "${saved.thinking}", which is no longer permitted for "${saved.model}".`);
+				if (policy.enabled && saved.thinking && effectiveLevels && !effectiveLevels.includes(saved.thinking as ThinkingLevel)) {
+					throw new Error(`The resumed session uses thinking level "${saved.thinking}", which is no longer permitted or supported for "${saved.model}".`);
 				}
 				config = saved;
 			} else {
-				const selected = resolveFreshModel(params.model, params.thinking, policy);
+				const selected = resolveFreshModel(params.model, params.thinking, policy, ctx.modelRegistry);
 				if (selected.error) throw new Error(selected.error);
 				const inheritedTools = pi.getActiveTools().filter((name) => !INTERNAL_TOOL_NAMES.has(name));
 				config = {

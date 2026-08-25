@@ -38,7 +38,7 @@ Thin does not mean limited. Most useful subagent behavior falls out of a few com
 | Correction or follow-up | Resume the same persisted child session |
 | Interrupt recovery | Abort flushes partial output and preserves the session |
 | Human observability | Live TUI updates plus a durable session receipt |
-| Model and cost control | Per-task model, thinking, and tool selection within user policy |
+| Model and cost control | Per-run model, thinking, and tool configuration, with optional model/thinking policy and explicit tool inheritance or replacement |
 
 Together these cover the common delegation lifecycle without requiring background jobs, polling, mailboxes, workflow graphs, or a custom scheduler. The extension stays small while the parent model composes the primitives according to the task.
 
@@ -52,7 +52,7 @@ A child does not need a mailbox or lifecycle protocol. It returns when it finish
 
 ### Timeout is a supervision point
 
-`timeoutMs` is not merely a hang guard. It defines when the parent should regain control and review progress. If the child is still working, its partial result and session path are preserved. The parent can then resume it for a status summary or with revised direction.
+`timeoutMs` is not merely a hang guard. It defines when the parent should regain control and review progress. If the child is still working, its partial result and session path are preserved. If the child's state is clear, the parent can resume it with revised direction. If not, the parent can first resume it for a concise state summary and use that summary to inform the next steering turn.
 
 ### Resume is steering
 
@@ -152,9 +152,9 @@ subagent {
 |---|---|
 | `task` | Self-contained assignment. On resume, this is the answer, correction, or next direction appended to the existing child session. |
 | `label` | Optional correlation label returned with the result. Useful when several sibling calls run concurrently. |
-| `model` | Pi model pattern or `provider/id` for a fresh run. With an enabled allowlist, it must exactly match an allowed ID. Omit it to use the configured default. |
-| `thinking` | Reasoning level for a fresh run. When model policy defines allowed levels, this is required and must match one of them. |
-| `tools` | Child tool allowlist. Choose the narrowest set that can complete the task. |
+| `model` | Pi model pattern or `provider/id` for a fresh run. With an enabled allowlist, it must exactly match an allowed ID. Omit it to use the policy default, or the child Pi default when policy is disabled. |
+| `thinking` | Reasoning level for a fresh run. It must be supported by the selected model and permitted by policy. When policy defines allowed levels, it is required and must match one of them; otherwise omission uses the child Pi default. |
+| `tools` | Tools for a fresh child. Omit to inherit the parent's active tools except `subagent` and `subagent_models`; `[]` disables tools; a non-empty array is the child's exact tool set. Add `subagent` alongside any other required tools only when the child must delegate further. |
 | `cwd` | Child working directory. Omit it to inherit the parent working directory. Setting it at startup controls path resolution and project-resource discovery. |
 | `timeoutMs` | Review horizon in milliseconds. No timeout is imposed when omitted. |
 | `resume` | Exact session JSONL path returned by an earlier call. Runtime configuration comes from the saved session. |
@@ -183,7 +183,7 @@ subagent {
 
 ### Timeout
 
-When the review horizon expires, the child process tree is stopped and the parent receives one result with `status=timeout`. It includes any partial assistant text already streamed, usage reported so far, and the child session path when Pi has persisted a session. There is no background result. The usual next step is to resume the child and ask it to summarize its current state, then resume again with direction if necessary.
+When the review horizon expires, the child process tree is stopped and the parent receives one result with `status=timeout`. It includes any partial assistant text already streamed and the child session path when Pi has persisted a session. Reported usage remains available to Pi's accounting and human-facing tool row rather than being added to the parent model's result text. There is no background result. Review the partial result. If the child's state is clear, resume it with the next direction. If the state is unclear, first resume it for a concise state summary, use that summary to decide how to proceed, and then resume again with informed direction.
 
 ### Human intervention
 
@@ -276,7 +276,7 @@ A model entry may be a plain ID or an object with per-level metadata:
 }
 ```
 
-When a non-empty `levels` object is present, `thinking` is required and its value must match one of the keys. Omitting `levels` leaves thinking unrestricted for that entry.
+When a non-empty `levels` object is present, `thinking` is required and its value must match one of the keys. Pi's model metadata narrows those configured keys to levels the model actually supports. Omitting `levels` permits the model's full Pi-supported set and allows the child Pi default when `thinking` is omitted.
 
 If the allowlist file is absent, model policy is disabled and the child may use Pi's normal model configuration.
 
@@ -306,9 +306,9 @@ Benchmark values inform model choice; Pi's model metadata remains authoritative 
 
 A child is a normal Pi process. It starts in the selected working directory and receives Pi's applicable project context and resources.
 
-Use `tools` to remove capabilities that are unnecessary for the delegated task. The names must be tools available to the child Pi process.
+Use `tools` to remove capabilities that are unnecessary for the delegated task. Omission inherits the parent's currently active tools except `subagent` and `subagent_models`; an empty array starts the child without tools; a non-empty array replaces inheritance and becomes the exact child tool set. The names must be tools available to the child Pi process.
 
-Recursive delegation is not enabled for children by default. Include `subagent` explicitly in the child's tools only when that child genuinely needs to orchestrate further isolated work.
+Recursive delegation is not enabled for children by default. Add `subagent` alongside any other required tools only when the child genuinely needs to orchestrate further isolated work. A list containing only `subagent` grants delegation but no file, shell, or editing tools.
 
 The goal is not to disable resources indiscriminately. Resources that do not affect the model's context or capabilities need no special treatment; relevant project instructions and skills should remain available.
 
@@ -317,7 +317,7 @@ The goal is not to disable resources indiscriminately. Resources that do not aff
 A result begins with a compact envelope followed by the child's final or partial text:
 
 ```text
-[label=auth-audit status=done model=provider/model thinking=high turns=6 cost=0.0413 exit=stop session=/.../child.jsonl]
+[label=auth-audit status=done session=/.../child.jsonl]
 <child output>
 ```
 
@@ -328,7 +328,7 @@ Possible statuses include:
 - `timeout`
 - `aborted`
 
-The envelope contains orchestration facts known by the extension. The child's payload is otherwise returned without imposing a universal report format.
+The model-facing envelope contains only the correlation label when supplied, status, and resumable session path when available. Model, thinking, activity, and usage details remain available to Pi's accounting and human-facing tool row without being copied into the parent model's result text. The child's payload is otherwise returned without imposing a universal report format.
 
 Child sessions are stored beneath Pi's session directory in a `subagent` run directory. The returned `session` path is both the resume handle and the diagnostic receipt.
 

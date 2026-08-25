@@ -37,8 +37,9 @@ test("registers the minimal two-tool surface with parent guidance", () => {
     "timeoutMs",
     "resume",
   ]);
-  assert.ok(tools[1].promptSnippet.includes("isolated"));
-  assert.ok(tools[1].promptGuidelines.some((line: string) => line.includes("clarification")));
+  assert.ok(tools[0].promptSnippet.includes("accepted by subagent"));
+  assert.ok(tools[1].promptSnippet.includes("resumable Pi session"));
+  assert.ok(tools[1].promptGuidelines.some((line: string) => line.includes("supervision checkpoint")));
   assert.ok(tools[1].promptGuidelines.some((line: string) => line.includes("concurrently")));
   assert.equal(Value.Check(tools[1].parameters, { task: "valid", thinking: "high" }), true);
   assert.equal(Value.Check(tools[1].parameters, { task: "valid", thinking: "invalid" }), false);
@@ -244,15 +245,16 @@ test("model policy loads a curated catalog and rejects unknown thinking levels",
 
   const { policy, error } = __testing.loadModelPolicy(configPath);
   assert.equal(error, undefined);
-  const catalog = __testing.compactModelCatalog(policy, []);
-  assert.deepEqual(catalog.models, [["provider/model", "impossible: unbenchmarked", "test model"]]);
-  const validation = __testing.validateModelPolicy(policy, {
+  const registry = {
     getAll: () => [{ provider: "provider", id: "model", reasoning: true }],
-  });
+  } as any;
+  const catalog = __testing.compactModelCatalog(policy, [], registry);
+  assert.deepEqual(catalog.models, [["provider/model", "", "test model"]]);
+  const validation = __testing.validateModelPolicy(policy, registry);
   assert.match(validation.join("\n"), /not recognized by Pi/);
 });
 
-test("model policy enforces exact models and thinking levels", () => {
+test("model policy enforces exact models and the Pi-supported thinking subset", () => {
   const policy = {
     enabled: true,
     allowed: new Set(["provider/model"]),
@@ -263,10 +265,38 @@ test("model policy enforces exact models and thinking levels", () => {
     configPath: "policy.json",
   };
 
-  assert.deepEqual(__testing.resolveFreshModel(undefined, "high", policy as any), { model: "provider/model" });
-  assert.match(__testing.resolveFreshModel(undefined, undefined, policy as any).error!, /Thinking level is required/);
-  assert.match(__testing.resolveFreshModel("other/model", "high", policy as any).error!, /not allowed/);
-  assert.match(__testing.resolveFreshModel("provider/model", "max", policy as any).error!, /Thinking level/);
+  const registry = {
+    getAll: () => [{ provider: "provider", id: "model", reasoning: true, thinkingLevelMap: { high: null } }],
+  } as any;
+
+  assert.match(__testing.validateModelPolicy(policy as any, registry).join("\n"), /"high" is unsupported/);
+  assert.deepEqual(__testing.resolveFreshModel(undefined, "low", policy as any, registry), { model: "provider/model" });
+  assert.match(__testing.resolveFreshModel(undefined, "high", policy as any, registry).error!, /not allowed/);
+  assert.match(__testing.resolveFreshModel(undefined, undefined, policy as any, registry).error!, /Thinking level is required/);
+  assert.match(__testing.resolveFreshModel("other/model", "high", policy as any, registry).error!, /not allowed/);
+  assert.match(__testing.resolveFreshModel("provider/model", "max", policy as any, registry).error!, /Thinking level/);
+});
+
+test("model-facing envelope keeps orchestration fields and excludes accounting details", () => {
+  const result: any = {
+    task: "done",
+    label: "parallel-a",
+    resumed: true,
+    timeoutMs: 1000,
+    exitCode: 0,
+    model: "provider/model",
+    thinking: "high",
+    stopReason: "stop",
+    sessionFile: "/tmp/child.jsonl",
+    toolActivity: [],
+    messages: [],
+    partialText: "finished",
+    stderr: "",
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 }, turns: 3 },
+  };
+  const output = __testing.modelFacingResult(result);
+  assert.match(output, /^\[label=parallel-a status=done session=\/tmp\/child\.jsonl\]/);
+  assert.doesNotMatch(output, /model=|thinking=|turns=|cost=|timeoutMs=|resumed=|exit=/);
 });
 
 test("model-facing output is capped", () => {
