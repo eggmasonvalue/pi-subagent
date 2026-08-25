@@ -183,25 +183,26 @@ subagent {
 
 ### Timeout
 
-When the review horizon expires, the child process tree is stopped and returns:
+When the review horizon expires, the extension stops the child process tree and returns a normal tool result to the parent. The result contains:
 
-- `status=timeout`;
-- any useful partial output already produced;
-- the persisted session path once the child initialized its session.
+- an envelope with `status=timeout` and `session=<absolute JSONL path>`;
+- the text currently being streamed for the in-progress assistant turn, if any;
+- otherwise the most recent completed assistant response, or an error/stderr message when there is no assistant text;
+- usage accumulated from completed turns plus the latest usage checkpoint reported by the child.
 
-The usual next step is to resume the child and ask it to summarize its current state, then resume again with direction if necessary. This is preferable to loading a large raw transcript into the parent context.
+It does not return a second hidden result or a promise for background work. The child is stopped; resume is a new synchronous call that appends the next user turn to the saved session. The usual next step is to resume the child and ask it to summarize its current state, then resume again with direction if necessary. This is preferable to loading a large raw transcript into the parent context.
 
 ### Human intervention
 
 Press Escape to interrupt a running delegation. Completed work and the child session are retained where possible. The human can then ask the parent to resume with new direction instead of waiting for the original timeout.
 
-After the child is no longer running, its session can also be opened directly:
+The returned path is the exact child session file. For a human-readable view, start a separate Pi process after the child is no longer running and open that session:
 
 ```bash
-pi --session "/path/from/the-result.jsonl"
+pi --session "/path/from-the-result.jsonl"
 ```
 
-Do not open the same session interactively while its worker process is still writing to it.
+You can also start a separate Pi process, type `/resume`, switch the selector to all sessions if necessary, and select the child from the `sessions/subagent/` directory. The direct command is still useful when you want to open the exact returned path without searching. Do not open the same session interactively while its worker process is still writing to it.
 
 ## Parallel work
 
@@ -253,7 +254,7 @@ Copy-Item extensions/subagent/models-allowlist.example.json "$HOME/.pi/agent/pi-
 
 The active policy is read from `~/.pi/agent/pi-subagent/models-allowlist.json` (`%USERPROFILE%\\.pi\\agent\\pi-subagent\\models-allowlist.json` on Windows), independently of whether the package was installed from npm or Git. `PI_CODING_AGENT_DIR` replaces the `~/.pi/agent` base when set.
 
-A model entry may be a plain ID or an object with per-level metadata:
+A model entry may be a plain ID or an object with per-level metadata. Use `description` to record the differentiating information that the compact `subagent_models` catalog cannot infer reliably: coding or reasoning strengths, speed/quality trade-offs, context-window considerations, cost expectations, and the task types for which this model is preferred. The allowlist itself is the policy boundary: when enabled, a child may use only an exact listed ID, and an entry with `levels` permits only the listed thinking levels.
 
 ```json
 {
@@ -262,7 +263,7 @@ A model entry may be a plain ID or an object with per-level metadata:
   "allowed": [
     {
       "id": "github-copilot/gpt-5.3-codex",
-      "description": "Strong default for coding tasks",
+      "description": "Strong repository-wide coding and debugging; prefer for complex implementation, not latency-sensitive lookups",
       "levels": {
         "low": {},
         "high": {
@@ -306,15 +307,23 @@ bun extensions/subagent/refresh-deepswe-benchmarks.ts --config /tmp/models-allow
 
 Benchmark values inform model choice; Pi's model metadata remains authoritative for capability validation. Users may omit benchmark fields and rely entirely on their own descriptions.
 
+### What the benchmark config file is
+
+`extensions/subagent/benchmark-config.ts` is not a user configuration file. It is a small shared implementation module used by the two refresh scripts for path resolution, JSON validation, and preservation of unknown fields.
+
+The user-controlled configuration is the active model allowlist:
+
+```text
+~/.pi/agent/pi-subagent/models-allowlist.json
+```
+
+(`%USERPROFILE%\\.pi\\agent\\pi-subagent\\models-allowlist.json` on Windows.) It contains the allowed exact model IDs, the optional default, optional per-model descriptions, allowed thinking levels, and optional benchmark metadata. The Artificial Analysis and DeepSWE scripts read that file and merge fresh values into the matching model/level entries; they do not define a separate benchmark database. `--config PATH` only selects another allowlist file for a refresh.
+
 ## Context and capabilities
 
 A child is a normal Pi process. It starts in the selected working directory and receives Pi's applicable project context and resources.
 
-Use `tools` to remove capabilities that are unnecessary for the delegated task. For example, a read-only investigation might receive:
-
-```json
-["read", "grep", "find", "ls"]
-```
+Use `tools` to remove capabilities that are unnecessary for the delegated task. The value is an allowlist of the tool names actually registered by the current Pi installation; available names vary with Pi configuration and installed extensions. The extension intentionally does not prescribe a list of names here—copying an example from a README can silently grant the wrong capabilities or fail to run. Pass only names you have verified in the target Pi session, or pass an empty array to disable child tools.
 
 Recursive delegation is not enabled for children by default. Include `subagent` explicitly in the child's tools only when that child genuinely needs to orchestrate further isolated work.
 
@@ -338,27 +347,29 @@ Possible statuses include:
 
 The envelope contains orchestration facts known by the extension. The child's payload is otherwise returned without imposing a universal report format.
 
-Child sessions are stored beneath Pi's session directory in a `subagent` run directory. The returned `session` path is both the resume handle and the diagnostic receipt.
+Child sessions are stored beneath Pi's session directory as uniquely named files in `subagent/` (`subagent/<run-id>.jsonl`). The returned `session` path is both the resume handle and the diagnostic receipt; because the files are in a normal session subdirectory, Pi's `/resume` selector can discover them.
 
-Session JSONL is intended primarily for debugging and verification. It contains structured conversation entries and may contain opaque provider reasoning data. When inspecting it programmatically, focus on user, assistant, and tool-result messages rather than attempting to interpret encrypted reasoning fields.
+Session JSONL is the authoritative persisted child conversation record. It contains structured session, user, assistant, and tool-result entries and may contain opaque provider reasoning data. A streamed assistant turn is normally persisted when it completes; if a timeout/abort interrupts that first turn, the current partial text is returned to the parent but may not yet be present in the JSONL. It is not a plain-text dump of every byte ever printed by a tool: a built-in tool may have already applied its own truncation or saved an auxiliary log. When inspecting it programmatically, focus on user, assistant, and tool-result messages rather than attempting to interpret encrypted reasoning fields.
 
 ## Human-visible output
 
-During a run, Pi's tool row shows useful child activity without adding that stream to the parent model's context:
+During a run, the parent TUI receives updates from the child's JSON event stream. The collapsed `subagent` tool row shows:
 
-- assistant progress;
-- tool calls;
-- completion or failure state;
-- model and usage information;
-- session path.
+- the label (or `child`/`resume`) and current status;
+- recent completed assistant text, tool calls, and tool-result summaries;
+- currently running tool calls;
+- turns, token/cost usage, selected model/thinking level, and the session path when known.
 
-Expand the tool row with Pi's normal tool-output control for more detail. The persisted session is the authoritative complete record.
+Partial assistant text is updated while the child is generating. The collapsed view keeps the last ten activity items and reports how many earlier items were omitted. Expand the row with Pi's normal tool-output control to see the task, all activity summaries collected by the extension, and the final or partial result. It does not mirror raw JSON events or provider reasoning into the parent conversation. The persisted session is the authoritative complete child record.
 
 ## Output limits
 
-Model-facing child output is capped at 50 KB per invocation to protect the parent context. The full conversation remains available in the persisted child session and tool details.
+There are two different limits:
 
-Child built-in tools retain Pi's own output-truncation behavior.
+1. **The extension's result envelope.** The text returned to the parent is passed through Pi's `50 * 1024` byte and 2000-line limits, keeping the beginning and adding an `Output truncated` notice when either limit is exceeded. This is a context-protection step performed by the extension. It does not create Pi's native temporary full-output log. The untruncated assistant message remains in the child session JSONL when that message was persisted (an interrupted in-progress turn may exist only as the returned partial text), and the full structured result is also retained in the tool details for the current TUI run.
+2. **Child tool output.** Built-in child tools retain their own Pi behavior. For example, `read` reports a continuation offset instead of pretending the file is complete, while `bash` keeps the bounded display and, when its output is truncated, may save the full shell output to a separate temporary log. These tool-specific details are recorded in the child session as the tool result, not replaced by the extension's final-response limit.
+
+Therefore, the child JSONL's final assistant message is the untruncated child response—not a native truncation log. It is the best durable record of that response, while a native tool-specific log path (when one exists) is the record for that tool's raw output.
 
 ## Implementation overview
 

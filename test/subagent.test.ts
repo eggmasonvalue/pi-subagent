@@ -66,6 +66,8 @@ test("fresh child streams, persists runtime metadata, and reports usage", async 
   assert.equal(result.usage.cost.total, 0.033);
   assert.ok(updates.includes("finished"));
   assert.ok(result.sessionFile && fs.existsSync(result.sessionFile));
+  assert.equal(path.dirname(result.sessionFile!), path.join(agentDir, "sessions", "subagent"));
+  assert.match(path.basename(result.sessionFile!), /\.jsonl$/);
   const metadata = __testing.readChildMetadata(result.sessionFile!);
   assert.deepEqual(metadata.tools, ["read", "bash"]);
   assert.equal(metadata.thinking, "low");

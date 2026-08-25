@@ -7,7 +7,7 @@
         "high": {},
         "xhigh": {}
       },
-      "description": "Why this model is allowed"
+      "description": "Describe this model's coding strengths, quality/latency trade-off, context and cost profile, and preferred task types"
     }
   ],
   "default": "provider/model-id"
