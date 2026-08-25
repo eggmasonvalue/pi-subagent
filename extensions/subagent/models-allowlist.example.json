@@ -7,7 +7,7 @@
         "high": {},
         "xhigh": {}
       },
-      "description": "Describe this model's coding strengths, quality/latency trade-off, context and cost profile, and preferred task types"
+      "description": "hints about this model and thinking levels"
     }
   ],
   "default": "provider/model-id"

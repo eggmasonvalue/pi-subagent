@@ -2,7 +2,7 @@
   "name": "@eggmasonvalue/pi-subagent",
   "version": "2.0.0",
   "type": "module",
-  "description": "Thin, observable, resumable isolated-context subagents for pi.",
+  "description": "Thin Pi subagent primitive: one synchronous call for isolated context, live progress, timeout supervision, resumable sessions, and per-task model/tool control.",
   "keywords": [
     "pi-package",
     "pi",

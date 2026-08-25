@@ -7,22 +7,14 @@ const valueAfter = (flag) => {
   return index >= 0 ? args[index + 1] : undefined;
 };
 
-const explicitSession = valueAfter("--session");
-const resumed = Boolean(
-  explicitSession &&
-  fs.existsSync(explicitSession) &&
-  fs.readFileSync(explicitSession, "utf8").includes('"type":"message"'),
-);
+const resume = valueAfter("--session");
 const sessionDir = valueAfter("--session-dir");
 let task = "";
 for await (const chunk of process.stdin) task += chunk.toString();
-let sessionFile = explicitSession;
+let sessionFile = resume;
 if (!sessionFile) {
   fs.mkdirSync(sessionDir, { recursive: true });
   sessionFile = path.join(sessionDir, "fake-session.jsonl");
-}
-if (!fs.existsSync(sessionFile)) {
-  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
   fs.writeFileSync(
     sessionFile,
     `${JSON.stringify({ type: "session", version: 3, id: "fake-session", timestamp: new Date().toISOString(), cwd: process.cwd() })}\n`,
@@ -64,7 +56,7 @@ if (task.includes("hang")) {
   }
   const message = {
     role: "assistant",
-    content: [{ type: "text", text: resumed ? "resumed result" : task.includes("unicode") ? streamedText : "finished result" }],
+    content: [{ type: "text", text: resume ? "resumed result" : task.includes("unicode") ? streamedText : "finished result" }],
     provider: "test-provider",
     model: "test-model",
     api: "openai-responses",

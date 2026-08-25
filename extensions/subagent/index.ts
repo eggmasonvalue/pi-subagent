@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -330,6 +329,16 @@ function resolveResumePath(input: string): string {
 	return resolved;
 }
 
+function resolveSessionFile(sessionDir: string, result: SubagentResult): void {
+	if (result.sessionFile) return;
+	try {
+		const file = fs.readdirSync(sessionDir).find((name) => name.endsWith(".jsonl"));
+		if (file) result.sessionFile = path.join(sessionDir, file);
+	} catch {
+		// The child may not have created its session yet.
+	}
+}
+
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
 	const bunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -356,8 +365,7 @@ function addUsage(total: UsageStats, usage: Usage): void {
 
 function getFinalOutput(result: SubagentResult): string {
 	// A timeout/abort can leave an in-progress turn in partialText after an
-	// earlier assistant turn has already completed. Return that checkpoint
-	// rather than silently preferring the older completed response.
+	// earlier assistant turn has already completed.
 	if (result.partialText.trim()) return result.partialText.trim();
 	for (let i = result.messages.length - 1; i >= 0; i--) {
 		const message = result.messages[i];
@@ -389,10 +397,13 @@ function resultOutput(result: SubagentResult): string {
 	return parts.join("\n\n") || "(no output)";
 }
 
-function truncateResult(output: string): string {
+function truncateResult(output: string, sessionFile?: string): string {
 	const truncated = truncateHead(output, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
 	if (!truncated.truncated) return output;
-	return `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines, ${truncated.outputBytes} of ${truncated.totalBytes} bytes. Full output is available in the child session.]`;
+	const sessionHint = sessionFile
+		? ` Read the last assistant message in the child session JSONL at ${sessionFile} if the complete response is needed.`
+		: " The complete response may be available in the child session JSONL.";
+	return `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines, ${truncated.outputBytes} of ${truncated.totalBytes} bytes.]${sessionHint}`;
 }
 
 function envelope(result: SubagentResult): string {
@@ -411,7 +422,7 @@ function envelope(result: SubagentResult): string {
 }
 
 function modelFacingResult(result: SubagentResult): string {
-	return `${envelope(result)}\n${truncateResult(resultOutput(result))}`;
+	return `${envelope(result)}\n${truncateResult(resultOutput(result), result.sessionFile)}`;
 }
 
 function killChild(proc: ChildProcess): void {
@@ -452,23 +463,12 @@ async function runChild(
 	dependencies: RunChildDependencies = {},
 ): Promise<SubagentResult> {
 	const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-	const sessionDir = path.join(dependencies.agentDir ?? getAgentDir(), "sessions", "subagent");
-	const newSessionFile = path.join(sessionDir, `${runId}.jsonl`);
-	if (!resumePath) {
-		await fs.promises.mkdir(sessionDir, { recursive: true });
-		// Pi normally delays creating a session file until an assistant message
-		// is persisted. Create a valid header up front so a timeout during the
-		// first streamed turn still leaves a resumable session to select/open.
-		await fs.promises.writeFile(
-			newSessionFile,
-			`${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd: config.cwd })}\n`,
-			{ encoding: "utf8", mode: 0o600 },
-		);
-	}
+	const sessionDir = path.join(dependencies.agentDir ?? getAgentDir(), "sessions", "subagent", runId);
+	if (!resumePath) await fs.promises.mkdir(sessionDir, { recursive: true });
 
 	const args = ["--mode", "json", "-p"];
 	if (resumePath) args.push("--session", resumePath);
-	else args.push("--session", newSessionFile);
+	else args.push("--session-dir", sessionDir);
 	if (config.model) args.push("--model", config.model);
 	if (config.thinking) args.push("--thinking", config.thinking);
 	if (config.tools.length === 0) args.push("--no-tools");
@@ -491,7 +491,7 @@ async function runChild(
 		usage: EMPTY_USAGE(),
 		model: config.model,
 		thinking: config.thinking,
-		sessionFile: resumePath ?? newSessionFile,
+		sessionFile: resumePath,
 	};
 
 	const emitUpdate = () => {
@@ -541,6 +541,7 @@ async function runChild(
 
 			if (event.type === "session" && event.id) {
 				result.sessionId = event.id;
+				if (!resumePath) resolveSessionFile(sessionDir, result);
 				emitUpdate();
 				return;
 			}
@@ -633,7 +634,8 @@ async function runChild(
 	result.exitCode = exitCode;
 	if (currentTurnUsage) addUsage(result.usage, currentTurnUsage);
 	if (!resumePath) {
-		if (!result.sessionFile || !fs.existsSync(result.sessionFile)) {
+		resolveSessionFile(sessionDir, result);
+		if (!result.sessionFile) {
 			result.errorMessage = "Child session was not created; this run cannot be resumed.";
 			if (!timedOut && !aborted) result.exitCode = 1;
 		} else {
