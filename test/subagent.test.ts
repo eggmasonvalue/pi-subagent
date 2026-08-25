@@ -95,6 +95,14 @@ test("timeout returns streamed partial text and a resumable session", async (t) 
   assert.match(__testing.modelFacingResult(result), /partial checkpoint/);
 });
 
+test("formats timeout badges compactly for the human-facing UI", () => {
+  assert.equal(__testing.timeoutBadge(undefined), "");
+  assert.equal(__testing.timeoutBadge(750), "[⏱ 750ms]");
+  assert.equal(__testing.timeoutBadge(1_500), "[⏱ 1.5s]");
+  assert.equal(__testing.timeoutBadge(125_000), "[⏱ 2m 5s]");
+  assert.equal(__testing.timeoutBadge(3_900_000), "[⏱ 1h 5m]");
+});
+
 test("abort returns partial text instead of throwing", async (t) => {
   const agentDir = tempAgentDir();
   t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));

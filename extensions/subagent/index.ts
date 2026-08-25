@@ -692,6 +692,36 @@ function formatTokens(count: number): string {
 	return `${(count / 1000000).toFixed(1)}M`;
 }
 
+function formatTimeout(timeoutMs: number | undefined): string {
+	if (timeoutMs === undefined) return "";
+	if (timeoutMs < 1000) return `${timeoutMs}ms`;
+	if (timeoutMs < 60_000) {
+		const seconds = Math.round(timeoutMs / 100) / 10;
+		return seconds >= 60 ? "1m" : `${seconds}s`;
+	}
+	if (timeoutMs < 3_600_000) {
+		let minutes = Math.floor(timeoutMs / 60_000);
+		let seconds = Math.round((timeoutMs % 60_000) / 1000);
+		if (seconds === 60) {
+			minutes++;
+			seconds = 0;
+		}
+		return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+	}
+	let hours = Math.floor(timeoutMs / 3_600_000);
+	let minutes = Math.round((timeoutMs % 3_600_000) / 60_000);
+	if (minutes === 60) {
+		hours++;
+		minutes = 0;
+	}
+	return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+function timeoutBadge(timeoutMs: number | undefined): string {
+	const formatted = formatTimeout(timeoutMs);
+	return formatted ? `[⏱ ${formatted}]` : "";
+}
+
 function usageText(result: SubagentResult): string {
 	const parts: string[] = [];
 	if (result.usage.turns) parts.push(`${result.usage.turns} turn${result.usage.turns === 1 ? "" : "s"}`);
@@ -777,6 +807,8 @@ export const __testing = {
 	statusOf,
 	validateModelPolicy,
 	writeChildMetadata,
+	formatTimeout,
+	timeoutBadge,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -867,8 +899,9 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			const preview = args.task.length > 72 ? `${args.task.slice(0, 72)}…` : args.task;
 			const identity = args.label ?? (args.resume ? "resume" : "child");
+			const timeout = timeoutBadge(typeof args.timeoutMs === "number" ? args.timeoutMs : undefined);
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", identity)}\n  ${theme.fg("dim", preview)}`,
+				`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", identity)}${timeout ? ` ${theme.fg("dim", timeout)}` : ""}\n  ${theme.fg("dim", preview)}`,
 				0,
 				0,
 			);
@@ -890,9 +923,11 @@ export default function (pi: ExtensionAPI) {
 			const title = result.label ?? (result.resumed ? "resumed child" : "child");
 			const items = displayItems(result);
 
+			const timeout = timeoutBadge(result.timeoutMs);
+
 			if (!expanded) {
 				const recent = items.slice(-COLLAPSED_ITEM_COUNT);
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(title))} ${theme.fg(success ? "success" : "warning", status)}`;
+				let text = `${icon} ${theme.fg("toolTitle", theme.bold(title))}${timeout ? ` ${theme.fg("dim", timeout)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`;
 				if (items.length > recent.length) text += `\n${theme.fg("muted", `… ${items.length - recent.length} earlier items`)}`;
 				for (const item of recent) text += `\n${theme.fg(item.type === "toolResult" && item.isError ? "error" : "dim", compactItem(item))}`;
 				for (const activity of result.toolActivity.filter((item) => item.status === "running")) {
@@ -905,7 +940,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const container = new Container();
-			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(title))} ${theme.fg(success ? "success" : "warning", status)}`, 0, 0));
+			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(title))}${timeout ? ` ${theme.fg("dim", timeout)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`, 0, 0));
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "── Task ──"), 0, 0));
 			container.addChild(new Text(result.task, 0, 0));
