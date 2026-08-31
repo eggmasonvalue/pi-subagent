@@ -20,7 +20,8 @@ The result is intentionally thin rather than universally comprehensive. It is de
 The control model is deliberately simple:
 
 ```text
-delegate → observe → return or timeout → resume with direction
+delegate → observe → return
+                   ↘ timeout → request checkpoint → decide whether and how to resume
 ```
 
 That small loop covers completion, clarification, supervision, recovery, and iterative work without a background-job system or a separate messaging protocol.
@@ -52,7 +53,7 @@ A child does not need a mailbox or lifecycle protocol. It returns when it finish
 
 ### Timeout is a supervision point
 
-`timeoutMs` is not merely a hang guard. It defines when the parent should regain control and review progress. If the child is still working, its partial result and session path are preserved. If the child's state is clear, the parent can resume it with revised direction. If not, the parent can first resume it for a concise state summary and use that summary to inform the next steering turn.
+`timeoutMs` is not merely a hang guard. It defines when the parent should regain control and review progress. If the child is still working, any assistant text it has already emitted and its session path are preserved. After a timeout, the parent resumes the same session only to request a concise progress report covering completed work, current step, blockers, and proposed next action. It does not ask the child to continue in that turn. Once the report returns, the parent decides whether to resume the child and steers any further work based on that report.
 
 ### Resume is steering
 
@@ -183,7 +184,12 @@ subagent {
 
 ### Timeout
 
-When the review horizon expires, the child process tree is stopped and the parent receives one result with `status=timeout`. It includes any partial assistant text already streamed and the child session path when Pi has persisted a session. Reported usage remains available to Pi's accounting and human-facing tool row rather than being added to the parent model's result text. There is no background result. Review the partial result. If the child's state is clear, resume it with the next direction. If the state is unclear, first resume it for a concise state summary, use that summary to decide how to proceed, and then resume again with informed direction.
+When the review horizon expires, the child process tree is stopped and the parent receives one result with `status=timeout`. It includes any assistant text already streamed and the child session path when Pi has persisted a session. Reported usage remains available to Pi's accounting and human-facing tool row rather than being added to the parent model's result text. There is no background result.
+
+After a timeout:
+
+1. Resume the same session only to request a concise progress report covering completed work, current step, blockers, and proposed next action. Do not ask it to continue in that turn.
+2. Once the report returns, decide whether to resume the child and steer any further work based on that report.
 
 ### Human intervention
 
