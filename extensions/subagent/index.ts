@@ -783,14 +783,14 @@ const SubagentParams = Type.Object({
 	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Fresh child only. Pi thinking level supported by the selected model and permitted by child-model policy. subagent_models lists the effective levels; omit to use the child Pi default unless policy requires a level." })),
 	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Fresh child only. Omit to inherit the parent's active tools except subagent and subagent_models; [] disables tools; a non-empty array is the child's exact tool set. Add subagent alongside any other required tools only when the child must delegate further." })),
 	cwd: Type.Optional(Type.String({ minLength: 1, description: "Working directory for a fresh child. Defaults to the parent cwd." })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Supervision checkpoint in milliseconds. On expiry, stops the child and returns partial work with its resumable session when available." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Supervision checkpoint in milliseconds. On expiry, stops the child and returns any assistant text already emitted plus its resumable session when available." })),
 	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call. Cannot be combined with fresh-child model, thinking, tools, or cwd." })),
 });
 
 const SUBAGENT_GUIDELINES = [
 	"Give subagent a self-contained task with relevant context, constraints, and the required output.",
 	"Issue independent subagent calls together to run them concurrently; partition write work so children do not edit the same files.",
-	"Treat subagent.timeoutMs as a supervision checkpoint, not merely a runtime limit; set it to when control should return for progress review. After a timeout, resume directly with direction when the child's state is clear; otherwise, resume for a concise state summary and then resume again with informed direction.",
+	"Treat subagent.timeoutMs as a supervision checkpoint, not merely a runtime limit; set it to when control should return for progress review. After a timeout: (1) resume the same session only to request a concise progress report covering completed work, current step, blockers, and proposed next action; do not ask it to continue in that turn; (2) once the report returns, decide whether to resume the child and steer any further work based on that report.",
 	"Prefer subagent.resume whenever the child's accumulated context remains useful, including for answers, corrections, or follow-up.",
 ];
 
