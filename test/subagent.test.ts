@@ -17,15 +17,21 @@ function runConfig(cwd: string) {
   return { cwd, model: undefined, thinking: "low", tools: ["read", "bash"] };
 }
 
-test("registers the minimal two-tool surface with parent guidance", () => {
+test("registers the minimal two-tool surface with parent guidance and the human-only viewer", () => {
   const tools: any[] = [];
+  const commands: string[] = [];
   registerSubagent({
     registerTool(tool: any) {
       tools.push(tool);
     },
+    registerCommand(name: string) {
+      commands.push(name);
+    },
+    on() {},
   } as any);
 
   assert.deepEqual(tools.map((tool) => tool.name), ["subagent_models", "subagent"]);
+  assert.deepEqual(commands, ["subagents"]);
   assert.deepEqual(Object.keys(tools[0].parameters.properties), []);
   assert.deepEqual(Object.keys(tools[1].parameters.properties), [
     "task",
@@ -268,6 +274,7 @@ test("live tool execution events are surfaced in updates", async (t) => {
   const agentDir = tempAgentDir();
   t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
   const states: string[][] = [];
+  const sessionsWhileRunning: (string | undefined)[] = [];
   const result = await __testing.runChild(
     runConfig(process.cwd()),
     "activity",
@@ -275,12 +282,17 @@ test("live tool execution events are surfaced in updates", async (t) => {
     undefined,
     undefined,
     undefined,
-    (partial: any) => states.push(partial.details.result.toolActivity.map((item: any) => item.status)),
+    (partial: any) => {
+      states.push(partial.details.result.toolActivity.map((item: any) => item.status));
+      if (partial.details.result.exitCode === -1) sessionsWhileRunning.push(partial.details.result.sessionFile);
+    },
     { agentDir, invoke: invocation },
   );
 
   assert.ok(states.some((state) => state.includes("running")));
   assert.equal(result.toolActivity[0].status, "done");
+  // The session file appears after the session event; a running child must still expose it.
+  assert.ok(sessionsWhileRunning.some((file) => file === result.sessionFile));
 });
 
 test("task text is transported over stdin and UTF-8 chunks are decoded safely", async (t) => {

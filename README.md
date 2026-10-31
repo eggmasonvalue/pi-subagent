@@ -38,7 +38,7 @@ Thin does not mean limited. Most useful subagent behavior falls out of a few com
 | Progress review | A task-specific timeout returns control to the parent |
 | Correction or follow-up | Resume the same persisted child session |
 | Interrupt recovery | Abort flushes partial output and preserves the session |
-| Human observability | Live TUI updates plus a durable session receipt |
+| Human observability | Live TUI updates, a `/subagents` transcript browser, and a durable session receipt |
 | Model and cost control | Per-run model, thinking, and tool configuration, with optional model/thinking policy and explicit tool inheritance, adjustment, or replacement |
 
 Together these cover the common delegation lifecycle without requiring background jobs, polling, mailboxes, workflow graphs, or a custom scheduler. The extension stays small while the parent model composes the primitives according to the task.
@@ -200,7 +200,7 @@ After the child is no longer running, its session can also be opened directly in
 pi --session "/path/from/the-result.jsonl"
 ```
 
-Use the exact returned path. Do not open the same session interactively while its worker process is still writing to it.
+Use the exact returned path. Do not open the same session interactively while its worker process is still writing to it. To watch a running child, use `/subagents` instead.
 
 ## Parallel work
 
@@ -355,6 +355,22 @@ During a run, Pi's tool row shows useful child activity without adding that stre
 
 Expand the tool row with Pi's normal tool-output control for more detail. The persisted session is the authoritative complete record.
 
+### Browsing child sessions
+
+`/subagents` lists the child sessions of the current conversation branch, one row per child, with running children first and then the most recent. Each row shows the child's label (or the start of its task), status, elapsed time, model, thinking level, and context fill. `/subagents <label>` opens a child directly, and labels tab-complete.
+
+Opening a child shows its full transcript, rendered with Pi's own message and tool components so it reads like the main conversation. This includes earlier resumes and compactions. While the child runs, the transcript updates live as the child appends to its session, with in-progress text streamed underneath. Nothing is polled.
+
+| Key | Action |
+|---|---|
+| ↑ ↓, PgUp PgDn, Home End | Scroll |
+| Ctrl+↑ Ctrl+↓ | Jump between user turns: the original task and each resume |
+| Ctrl+O | Expand or collapse tool output and summaries |
+| Enter | Close and copy `pi --session "<path>"` for continuing the child elsewhere once it has stopped |
+| Esc | Close |
+
+The browser is read-only and human-only: it adds nothing to the model's tools or context.
+
 ## Output limits
 
 The extension caps the result text sent to the parent at Pi's standard 50 KB or 2000-line limit, keeping the beginning. If the cap is reached, the result points the main agent to the last assistant message in the child session JSONL; it does not create a separate full-output log. Child built-in tools retain Pi's own output-truncation behavior.
@@ -392,6 +408,7 @@ pi-subagent/
 └── extensions/
     └── subagent/
         ├── index.ts
+        ├── viewer.ts
         ├── benchmark-config.ts
         ├── models-allowlist.example.json
         ├── refresh-aa-benchmarks.ts

@@ -13,9 +13,11 @@ import {
 	getMarkdownTheme,
 	truncateHead,
 	type Theme,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { LiveRuns, registerViewer } from "./viewer.ts";
 
 const CHILD_SYSTEM_GUIDANCE =
 	"Work independently on the delegated task. If you cannot proceed reliably without clarification, a decision, or missing information, stop and return the precise question or blocker to your supervisor. Do not guess or wait. Your supervisor can resume this session with an answer.";
@@ -45,7 +47,7 @@ interface ToolActivity {
 	status: "running" | "done" | "error";
 }
 
-interface SubagentResult {
+export interface SubagentResult {
 	task: string;
 	label?: string;
 	resumed: boolean;
@@ -596,10 +598,14 @@ async function runChild(
 				return;
 			}
 
+			// Pi creates the session file only once the first message is persisted, after the session
+			// event, so keep looking until it exists; the check short-circuits once found.
+			if (!result.sessionFile) {
+				resolveSessionFile(sessionDir, result);
+				if (result.sessionFile) emitUpdate();
+			}
 			if (event.type === "session" && event.id) {
 				result.sessionId = event.id;
-				if (!resumePath) resolveSessionFile(sessionDir, result);
-				emitUpdate();
 				return;
 			}
 			if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -770,6 +776,16 @@ function contextText(result: SubagentResult): string {
 	return `${Math.round((used / result.contextWindow) * 100)}%/${formatTokens(result.contextWindow)}`;
 }
 
+function childSummary(result: SubagentResult): string {
+	const parts: string[] = [statusOf(result)];
+	if (result.startedAt) parts.push(formatTimeout(Math.max(0, (result.endedAt ?? Date.now()) - result.startedAt)));
+	const model = [result.model, result.thinking].filter(Boolean).join(" ");
+	if (model) parts.push(model);
+	const context = contextText(result);
+	if (context) parts.push(`ctx ${context}`);
+	return parts.join(" · ");
+}
+
 function usageText(result: SubagentResult): string {
 	const parts: string[] = [];
 	if (result.usage.turns) parts.push(`${result.usage.turns} turn${result.usage.turns === 1 ? "" : "s"}`);
@@ -893,7 +909,15 @@ function renderModelCatalog(catalog: ModelCatalog, expanded: boolean, theme: The
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerTool({
+	const runs = new LiveRuns();
+	const toolDefinitions: Record<string, ToolDefinition<any, any>> = {};
+	const registerTool: ExtensionAPI["registerTool"] = (tool) => {
+		toolDefinitions[tool.name] = tool;
+		pi.registerTool(tool);
+	};
+	registerViewer(pi, { runs, statusOf, summarize: childSummary, toolDefinitions });
+
+	registerTool({
 		name: "subagent_models",
 		label: "Subagent Models",
 		description: "Return the model ids and model-supported thinking levels accepted by subagent under the configured child-model policy, with the default and optional benchmark notes. No child is started.",
@@ -919,14 +943,14 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
+	registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: "Run one task in a separate Pi session and return its final or partial response with a session path that can be resumed.",
 		promptSnippet: "Run a task in a separate resumable Pi session",
 		promptGuidelines: SUBAGENT_GUIDELINES,
 		parameters: SubagentParams,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			if (!params.task.trim()) throw new Error("Subagent task must not be blank.");
 			const { policy, error: policyError } = loadModelPolicy();
 			if (policyError) throw new Error(policyError);
@@ -973,8 +997,25 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await runChild(config, params.task, label, params.timeoutMs, resumePath, signal, onUpdate);
-			if (result.model) result.contextWindow = modelMap(ctx.modelRegistry).get(result.model)?.contextWindow;
+			// Resolve the context window once per reported model, and publish every update to the
+			// /subagents viewer through the live-run registry.
+			let windowFor: string | undefined;
+			const withWindow = (live: SubagentResult) => {
+				if (live.model === windowFor) return;
+				windowFor = live.model;
+				live.contextWindow = live.model ? modelMap(ctx.modelRegistry).get(live.model)?.contextWindow : undefined;
+			};
+			let result: SubagentResult;
+			try {
+				result = await runChild(config, params.task, label, params.timeoutMs, resumePath, signal, (partial) => {
+					withWindow(partial.details.result);
+					onUpdate?.(partial);
+					runs.update(toolCallId, partial.details.result);
+				});
+			} finally {
+				runs.end(toolCallId);
+			}
+			withWindow(result);
 			return {
 				content: [{ type: "text", text: modelFacingResult(result) }],
 				details: { result },
