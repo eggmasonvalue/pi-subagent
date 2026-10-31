@@ -27,11 +27,21 @@ const toolResultEntry = (id: string, timestamp: string, details: unknown): any =
   message: { role: "toolResult", toolName: "subagent", toolCallId: id, content: [], details, isError: false },
 });
 
+const callsEntry = (ids: string[]): any => ({
+  type: "message",
+  id: `calls-${ids.join("-")}`,
+  parentId: null,
+  timestamp: "2026-01-01T00:00:00Z",
+  message: { role: "assistant", content: ids.map((id) => ({ type: "toolCall", id, name: "subagent", arguments: {} })) },
+});
+
 test("children are one row per session, running first, carrying their original label and task", () => {
   const runs = new LiveRuns();
   const branch = [
+    callsEntry(["a", "b"]),
     toolResultEntry("a", "2026-01-01T00:00:00Z", { result: result({ sessionFile: "/a.jsonl", label: "audit", task: "audit auth" }) }),
     toolResultEntry("b", "2026-01-01T00:01:00Z", { result: result({ sessionFile: "/b.jsonl", task: "map tests" }) }),
+    callsEntry(["c", "live"]),
     toolResultEntry("c", "2026-01-01T00:02:00Z", { result: result({ sessionFile: "/a.jsonl", resumed: true, task: "continue" }) }),
     { type: "message", id: "d", parentId: null, timestamp: "2026-01-01T00:03:00Z", message: { role: "user", content: "hi" } },
   ];
@@ -43,9 +53,28 @@ test("children are one row per session, running first, carrying their original l
   assert.equal(children[1].label, "audit");
   assert.equal(children[1].task, "audit auth");
   assert.equal(children[1].result.task, "continue");
+});
 
-  runs.end("live");
-  assert.equal(__testing.listChildren(branch, runs).length, 2);
+test("a finished sibling stays listed until Pi persists the batch's results", () => {
+  const runs = new LiveRuns();
+  const branch = [callsEntry(["fast", "slow"])];
+  runs.update("fast", result({ sessionFile: "/fast.jsonl", label: "fast", exitCode: -1 }));
+  runs.update("slow", result({ sessionFile: "/slow.jsonl", label: "slow", exitCode: -1 }));
+  runs.update("elsewhere", result({ sessionFile: "/other.jsonl", exitCode: -1 }));
+  runs.end("fast");
+
+  const during = __testing.listChildren(branch, runs);
+  assert.deepEqual(during.map((child) => [child.label, child.running]), [["slow", true], ["fast", false]]);
+  assert.equal(runs.isRunning("/fast.jsonl"), false);
+
+  runs.end("slow");
+  const persisted = [
+    ...branch,
+    toolResultEntry("fast", "2026-01-01T00:05:00Z", { result: result({ sessionFile: "/fast.jsonl", label: "fast" }) }),
+    toolResultEntry("slow", "2026-01-01T00:05:00Z", { result: result({ sessionFile: "/slow.jsonl", label: "slow" }) }),
+  ];
+  assert.equal(__testing.listChildren(persisted, runs).length, 2);
+  assert.deepEqual([...runs.entries()].map(([id]) => id), ["elsewhere"]);
 });
 
 test("a session branch follows parent links from the last entry", () => {
@@ -76,7 +105,7 @@ test("transcript renders a child session, strips terminal sequences, and tails a
   const runs = new LiveRuns();
   const live = result({ sessionFile: file, label: "scout", exitCode: -1, partialText: "still thinking" });
   runs.update("call", live);
-  const child = __testing.listChildren([], runs)[0];
+  const child = __testing.listChildren([callsEntry(["call"])], runs)[0];
   const tui: any = { terminal: { rows: 40 }, requestRender() {} };
   const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   const keybindings: any = { matches: () => false };
