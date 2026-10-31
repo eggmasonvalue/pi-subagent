@@ -131,6 +131,22 @@ test("tools inherit, replace, or adjust the inherited set", () => {
   assert.throws(() => __testing.resolveChildTools(inherited, ["+"]), /Invalid tools entry/);
 });
 
+test("the label is persisted with the child so resumes carry it", async (t) => {
+  const agentDir = tempAgentDir();
+  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
+  const result = await __testing.runChild(
+    runConfig(process.cwd()),
+    "finish",
+    "auth-audit",
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { agentDir, invoke: invocation },
+  );
+  assert.equal(__testing.readChildMetadata(result.sessionFile!).label, "auth-audit");
+});
+
 test("a stale allowlist entry blocks only calls that use it", () => {
   const policy: any = {
     enabled: true,
@@ -384,6 +400,7 @@ test("model-facing envelope keeps orchestration fields and excludes accounting d
     timeoutMs: 1000,
     exitCode: 0,
     model: "provider/model",
+    contextWindow: 200_000,
     thinking: "high",
     stopReason: "stop",
     sessionFile: "/tmp/child.jsonl",
@@ -391,10 +408,12 @@ test("model-facing envelope keeps orchestration fields and excludes accounting d
     messages: [],
     partialText: "finished",
     stderr: "",
-    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 }, turns: 3 },
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 84_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 }, turns: 3 },
   };
   const output = __testing.modelFacingResult(result);
-  assert.match(output, /^\[label=parallel-a status=done session=\/tmp\/child\.jsonl\]/);
+  assert.match(output, /^\[label=parallel-a status=done context=42%\/200k session=\/tmp\/child\.jsonl\]/);
+  assert.match(__testing.envelope({ ...result, contextWindow: undefined }), /context=84k /);
+  assert.doesNotMatch(__testing.envelope({ ...result, usage: { ...result.usage, totalTokens: 0 } }), /context=/);
   assert.doesNotMatch(output, /model=|thinking=|turns=|cost=|timeoutMs=|resumed=|exit=/);
 });
 

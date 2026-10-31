@@ -142,7 +142,6 @@ A continuation uses:
 subagent {
   task: string;
   resume: string;
-  label?: string;
   timeoutMs?: number;
 }
 ```
@@ -152,7 +151,7 @@ subagent {
 | Parameter | Meaning |
 |---|---|
 | `task` | Self-contained assignment. On resume, this is the answer, correction, or next direction appended to the existing child session. |
-| `label` | Optional correlation label returned with the result. Useful when several sibling calls run concurrently. |
+| `label` | Optional correlation label for a fresh child. It is saved with the child and returned with every result of that child, including resumes. Useful when several sibling calls run concurrently. |
 | `model` | Pi model pattern or `provider/id` for a fresh run. With an enabled allowlist, it must exactly match an allowed ID. Omit it to use the policy default, or the child Pi default when policy is disabled. |
 | `thinking` | Reasoning level for a fresh run. It must be supported by the selected model and permitted by policy. When policy defines allowed levels, it is required and must match one of them; otherwise omission uses the child Pi default. |
 | `tools` | Tools for a fresh child. Omit to inherit the parent's active tools except `subagent` and `subagent_models`; `[]` disables tools; plain names are the child's exact tool set; a list of only `+name`/`-name` entries adds to or removes from the inherited set (`["-bash"]`, `["+subagent"]`). Add `subagent` only when the child must delegate further. |
@@ -160,7 +159,7 @@ subagent {
 | `timeoutMs` | Review horizon in milliseconds. No timeout is imposed when omitted. |
 | `resume` | Exact session JSONL path returned by an earlier call. Runtime configuration comes from the saved session. |
 
-Fresh-run configuration such as `model`, `thinking`, `tools`, and `cwd` is not changed during resume. Start a new child when different runtime configuration is required.
+A child's identity and runtime configuration, namely `label`, `model`, `thinking`, `tools`, and `cwd`, are fixed when it is created and come from the saved session on resume. Start a new child when a different configuration is required.
 
 ## The supervision loop
 
@@ -326,7 +325,7 @@ The goal is not to disable resources indiscriminately. Resources that do not aff
 A result begins with a compact envelope followed by the child's final or partial text:
 
 ```text
-[label=auth-audit status=done session=/.../child.jsonl]
+[label=auth-audit status=done context=42%/200k session=/.../child.jsonl]
 <child output>
 ```
 
@@ -337,7 +336,7 @@ Possible statuses include:
 - `timeout`
 - `aborted`
 
-The model-facing envelope contains only the correlation label when supplied, status, and resumable session path when available. Model, thinking, activity, and usage details remain available to Pi's accounting and human-facing tool row without being copied into the parent model's result text. The child's payload is otherwise returned without imposing a universal report format.
+The model-facing envelope contains only the correlation label when supplied, status, context fill, and resumable session path when available. `context` is the child's last-turn token count as a share of its model's context window (just the token count when the window is unknown). It helps the parent decide whether to resume a child or start a fresh one. Model, thinking, activity, and usage details remain available to Pi's accounting and human-facing tool row without being copied into the parent model's result text. The child's payload is otherwise returned without imposing a universal report format.
 
 Child sessions are stored beneath Pi's session directory in a `subagent` run directory. The returned `session` path is both the resume handle and the diagnostic receipt.
 

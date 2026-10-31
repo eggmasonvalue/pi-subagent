@@ -31,6 +31,7 @@ interface UsageStats extends Usage {
 
 interface ChildMetadata {
 	version: 2;
+	label?: string;
 	cwd: string;
 	model?: string;
 	thinking?: string;
@@ -58,6 +59,7 @@ interface SubagentResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	contextWindow?: number;
 	thinking?: string;
 	stopReason?: string;
 	errorMessage?: string;
@@ -362,6 +364,7 @@ function readChildMetadata(sessionFile: string): ChildMetadata {
 	}
 	return {
 		version: 2,
+		label: typeof value.label === "string" ? value.label : undefined,
 		cwd: value.cwd,
 		model: typeof value.model === "string" ? value.model : undefined,
 		thinking: typeof value.thinking === "string" ? value.thinking : undefined,
@@ -468,6 +471,8 @@ function envelope(result: SubagentResult): string {
 	const fields: string[] = [];
 	if (result.label) fields.push(`label=${result.label}`);
 	fields.push(`status=${statusOf(result)}`);
+	const context = contextText(result);
+	if (context) fields.push(`context=${context}`);
 	if (result.sessionFile) fields.push(`session=${result.sessionFile}`);
 	return `[${fields.join(" ")}]`;
 }
@@ -696,6 +701,7 @@ async function runChild(
 			try {
 				writeChildMetadata(result.sessionFile, {
 					version: 2,
+					label,
 					cwd: config.cwd,
 					model: config.model,
 					thinking: config.thinking,
@@ -756,6 +762,14 @@ function elapsedBadge(result: SubagentResult, now = Date.now()): string {
 	return `[⏱ ${elapsed}${limit ? ` / ${limit}` : ""}]`;
 }
 
+// Last turn's total tokens against the model's window, e.g. "42%/200k"; just the tokens if the window is unknown.
+function contextText(result: SubagentResult): string {
+	const used = result.usage.totalTokens;
+	if (!used) return "";
+	if (!result.contextWindow) return formatTokens(used);
+	return `${Math.round((used / result.contextWindow) * 100)}%/${formatTokens(result.contextWindow)}`;
+}
+
 function usageText(result: SubagentResult): string {
 	const parts: string[] = [];
 	if (result.usage.turns) parts.push(`${result.usage.turns} turn${result.usage.turns === 1 ? "" : "s"}`);
@@ -764,7 +778,8 @@ function usageText(result: SubagentResult): string {
 	if (result.usage.cacheRead) parts.push(`R${formatTokens(result.usage.cacheRead)}`);
 	if (result.usage.cacheWrite) parts.push(`W${formatTokens(result.usage.cacheWrite)}`);
 	if (result.usage.cost.total) parts.push(`$${result.usage.cost.total.toFixed(4)}`);
-	if (result.usage.totalTokens) parts.push(`ctx:${formatTokens(result.usage.totalTokens)}`);
+	const context = contextText(result);
+	if (context) parts.push(`ctx:${context}`);
 	if (result.model) parts.push(result.model);
 	if (result.thinking) parts.push(result.thinking);
 	return parts.join(" ");
@@ -812,13 +827,13 @@ function compactItem(item: DisplayItem): string {
 
 const SubagentParams = Type.Object({
 	task: Type.String({ minLength: 1, description: "Self-contained assignment for a fresh child, or the next instruction for a resumed child." }),
-	label: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$", description: "Short correlation label returned with the result." })),
+	label: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$", description: "Fresh child only. Short correlation label returned with every result of this child, including resumes." })),
 	model: Type.Optional(Type.String({ minLength: 1, description: "Fresh child only. Pi model pattern or provider/id. With child-model policy enabled, use an exact id from subagent_models; omit to use the policy default, or the child Pi default when policy is disabled." })),
 	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Fresh child only. Pi thinking level supported by the selected model and permitted by child-model policy. subagent_models lists the effective levels; omit to use the child Pi default unless policy requires a level." })),
 	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Fresh child only. Omit to inherit the parent's active tools except subagent and subagent_models; [] disables tools; plain names are the child's exact tool set; a list of only +name/-name entries adds to or removes from the inherited set. Add subagent only when the child must delegate further." })),
 	cwd: Type.Optional(Type.String({ minLength: 1, description: "Working directory for a fresh child. Defaults to the parent cwd." })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Supervision checkpoint in milliseconds. On expiry, stops the child and returns any assistant text already emitted plus its resumable session when available." })),
-	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call. Cannot be combined with fresh-child model, thinking, tools, or cwd." })),
+	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call. Cannot be combined with fresh-child label, model, thinking, tools, or cwd." })),
 });
 
 const SUBAGENT_GUIDELINES = [
@@ -918,9 +933,10 @@ export default function (pi: ExtensionAPI) {
 
 			let resumePath: string | undefined;
 			let config: RunConfig;
+			let label = params.label;
 			if (params.resume) {
-				if (params.model || params.thinking || params.tools || params.cwd) {
-					throw new Error("A resumed subagent accepts only task, resume, label, and timeoutMs. Start a fresh child to change runtime configuration.");
+				if (params.label || params.model || params.thinking || params.tools || params.cwd) {
+					throw new Error("A resumed subagent accepts only task, resume, and timeoutMs; it keeps its original label and runtime configuration. Start a fresh child to change them.");
 				}
 				resumePath = resolveResumePath(params.resume);
 				const saved = readChildMetadata(resumePath);
@@ -944,6 +960,7 @@ export default function (pi: ExtensionAPI) {
 					throw new Error(`The resumed session uses thinking level "${saved.thinking}", which is no longer permitted or supported for "${saved.model}".`);
 				}
 				config = saved;
+				label = saved.label;
 			} else {
 				const selected = resolveFreshModel(params.model, params.thinking, policy, ctx.modelRegistry);
 				if (selected.error) throw new Error(selected.error);
@@ -956,7 +973,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const result = await runChild(config, params.task, params.label, params.timeoutMs, resumePath, signal, onUpdate);
+			const result = await runChild(config, params.task, label, params.timeoutMs, resumePath, signal, onUpdate);
+			if (result.model) result.contextWindow = modelMap(ctx.modelRegistry).get(result.model)?.contextWindow;
 			return {
 				content: [{ type: "text", text: modelFacingResult(result) }],
 				details: { result },
