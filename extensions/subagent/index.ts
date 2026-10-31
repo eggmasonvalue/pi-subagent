@@ -12,8 +12,9 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	truncateHead,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const CHILD_SYSTEM_GUIDANCE =
@@ -48,6 +49,8 @@ interface SubagentResult {
 	label?: string;
 	resumed: boolean;
 	timeoutMs?: number;
+	startedAt: number;
+	endedAt?: number;
 	exitCode: number;
 	messages: Message[];
 	toolActivity: ToolActivity[];
@@ -245,9 +248,11 @@ function resolveFreshModel(
 	if (!policy.allowed.has(model)) {
 		return { error: `Model "${model}" is not allowed. Call subagent_models for permitted models.` };
 	}
+	// Only the model being launched must exist in Pi; a stale entry elsewhere in the allowlist must not block this call.
+	const knownModel = registry ? modelMap(registry).get(model) : undefined;
+	if (registry && !knownModel) return { error: `Model "${model}" is not known to Pi.` };
 	const entry = policy.metadata.get(model);
 	const configuredLevels = allowedThinkingLevels(entry);
-	const knownModel = registry ? modelMap(registry).get(model) : undefined;
 	const levels = knownModel ? effectiveThinkingLevels(entry, knownModel) : configuredLevels;
 	const selectedThinking = thinking || policy.defaultThinking;
 	if (!selectedThinking && configuredLevels) {
@@ -257,6 +262,25 @@ function resolveFreshModel(
 		return { error: `Thinking level "${selectedThinking}" is not allowed for "${model}". Allowed: ${levels.join(", ") || "none"}.` };
 	}
 	return selectedThinking && !thinking ? { model, thinking: selectedThinking } : { model };
+}
+
+// Omitted inherits the parent's tools; plain names are the exact set; a list of only +name/-name
+// entries adjusts the inherited set, mirroring Pi's own --tools modifier syntax.
+function resolveChildTools(inherited: readonly string[], requested: readonly string[] | undefined): string[] {
+	if (!requested) return [...inherited];
+	const modifiers = requested.filter((entry) => /^[+-]/.test(entry));
+	if (modifiers.length === 0) return [...new Set(requested)];
+	if (modifiers.length < requested.length) {
+		throw new Error("`tools` must be either plain tool names or only +name/-name entries, not a mix.");
+	}
+	const tools = new Set(inherited);
+	for (const entry of modifiers) {
+		const name = entry.slice(1);
+		if (!name) throw new Error(`Invalid tools entry "${entry}".`);
+		if (entry[0] === "+") tools.add(name);
+		else tools.delete(name);
+	}
+	return [...tools];
 }
 
 function formatLevels(levels: ThinkingLevel[], metadata: unknown): string {
@@ -510,6 +534,7 @@ async function runChild(
 		label,
 		resumed: Boolean(resumePath),
 		timeoutMs,
+		startedAt: Date.now(),
 		exitCode: -1,
 		messages: [],
 		toolActivity: [],
@@ -608,8 +633,10 @@ async function runChild(
 				result.messages.push(message);
 				if (message.role === "assistant") {
 					result.partialText = "";
+					// A terminal error message may carry no usage after usage was already streamed.
+					const usage = message.usage ?? currentTurnUsage;
 					currentTurnUsage = undefined;
-					if (message.usage) addUsage(result.usage, message.usage);
+					if (usage) addUsage(result.usage, usage);
 					const reportedModel = message.model as string | undefined;
 					const provider = (message as any).provider as string | undefined;
 					if (reportedModel && !config.model) {
@@ -682,6 +709,7 @@ async function runChild(
 	}
 	if (timedOut) result.stopReason = "timeout";
 	else if (aborted) result.stopReason = "aborted";
+	result.endedAt = Date.now();
 	return result;
 }
 
@@ -720,6 +748,12 @@ function formatTimeout(timeoutMs: number | undefined): string {
 function timeoutBadge(timeoutMs: number | undefined): string {
 	const formatted = formatTimeout(timeoutMs);
 	return formatted ? `[⏱ ${formatted}]` : "";
+}
+
+function elapsedBadge(result: SubagentResult, now = Date.now()): string {
+	const elapsed = formatTimeout(Math.max(0, (result.endedAt ?? now) - result.startedAt));
+	const limit = formatTimeout(result.timeoutMs);
+	return `[⏱ ${elapsed}${limit ? ` / ${limit}` : ""}]`;
 }
 
 function usageText(result: SubagentResult): string {
@@ -781,7 +815,7 @@ const SubagentParams = Type.Object({
 	label: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9._:-]+$", description: "Short correlation label returned with the result." })),
 	model: Type.Optional(Type.String({ minLength: 1, description: "Fresh child only. Pi model pattern or provider/id. With child-model policy enabled, use an exact id from subagent_models; omit to use the policy default, or the child Pi default when policy is disabled." })),
 	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Fresh child only. Pi thinking level supported by the selected model and permitted by child-model policy. subagent_models lists the effective levels; omit to use the child Pi default unless policy requires a level." })),
-	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Fresh child only. Omit to inherit the parent's active tools except subagent and subagent_models; [] disables tools; a non-empty array is the child's exact tool set. Add subagent alongside any other required tools only when the child must delegate further." })),
+	tools: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true, description: "Fresh child only. Omit to inherit the parent's active tools except subagent and subagent_models; [] disables tools; plain names are the child's exact tool set; a list of only +name/-name entries adds to or removes from the inherited set. Add subagent only when the child must delegate further." })),
 	cwd: Type.Optional(Type.String({ minLength: 1, description: "Working directory for a fresh child. Defaults to the parent cwd." })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Supervision checkpoint in milliseconds. On expiry, stops the child and returns any assistant text already emitted plus its resumable session when available." })),
 	resume: Type.Optional(Type.String({ minLength: 1, description: "Exact absolute session JSONL path returned by an earlier subagent call. Cannot be combined with fresh-child model, thinking, tools, or cwd." })),
@@ -802,6 +836,7 @@ export const __testing = {
 	metadataPath,
 	modelFacingResult,
 	readChildMetadata,
+	resolveChildTools,
 	resolveFreshModel,
 	runChild,
 	statusOf,
@@ -809,7 +844,38 @@ export const __testing = {
 	writeChildMetadata,
 	formatTimeout,
 	timeoutBadge,
+	elapsedBadge,
+	modelsHeadline,
 };
+
+type ModelCatalog = ReturnType<typeof compactModelCatalog>;
+
+function modelsHeadline(catalog: ModelCatalog): string {
+	if (!catalog.allowlistEnabled) return "allowlist not configured";
+	const count = `${catalog.models.length} model${catalog.models.length === 1 ? "" : "s"}`;
+	if (!catalog.default) return count;
+	return `${count}, default: ${catalog.default}${catalog.defaultThinking ? ` (${catalog.defaultThinking})` : ""}`;
+}
+
+function renderModelCatalog(catalog: ModelCatalog, expanded: boolean, theme: Theme): Component {
+	const errors = catalog.validationErrors;
+	const warning = errors.length ? theme.fg("warning", ` · ${errors.length} allowlist issue${errors.length === 1 ? "" : "s"}`) : "";
+	const headline = `${theme.fg("muted", modelsHeadline(catalog))}${warning}`;
+	if (!expanded) return new Text(headline, 0, 0);
+	const container = new Container();
+	container.addChild(new Text(headline, 0, 0));
+	for (const [id, levels, description] of catalog.models) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("accent", String(id)), 0, 0));
+		if (levels) container.addChild(new Text(theme.fg("muted", String(levels)), 0, 0));
+		if (description) container.addChild(new Text(theme.fg("dim", String(description)), 0, 0));
+	}
+	if (errors.length) {
+		container.addChild(new Spacer(1));
+		for (const error of errors) container.addChild(new Text(theme.fg("warning", `! ${error}`), 0, 0));
+	}
+	return container;
+}
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
@@ -828,6 +894,14 @@ export default function (pi: ExtensionAPI) {
 				details: catalog,
 			};
 		},
+		renderResult(toolResult, { expanded }, theme) {
+			const catalog = toolResult.details as ModelCatalog | undefined;
+			if (!catalog?.models) {
+				const content = toolResult.content[0];
+				return new Text(content?.type === "text" ? content.text : "(no output)", 0, 0);
+			}
+			return renderModelCatalog(catalog, expanded, theme);
+		},
 	});
 
 	pi.registerTool({
@@ -841,8 +915,6 @@ export default function (pi: ExtensionAPI) {
 			if (!params.task.trim()) throw new Error("Subagent task must not be blank.");
 			const { policy, error: policyError } = loadModelPolicy();
 			if (policyError) throw new Error(policyError);
-			const validationErrors = validateModelPolicy(policy, ctx.modelRegistry);
-			if (validationErrors.length > 0) throw new Error(validationErrors.join("\n"));
 
 			let resumePath: string | undefined;
 			let config: RunConfig;
@@ -861,6 +933,9 @@ export default function (pi: ExtensionAPI) {
 				const entry = saved.model ? policy.metadata.get(saved.model) : undefined;
 				const configuredLevels = allowedThinkingLevels(entry);
 				const savedModel = saved.model ? modelMap(ctx.modelRegistry).get(saved.model) : undefined;
+				if (policy.enabled && !savedModel) {
+					throw new Error(`The resumed session uses model "${saved.model}", which is not known to Pi.`);
+				}
 				const effectiveLevels = savedModel ? effectiveThinkingLevels(entry, savedModel) : undefined;
 				if (policy.enabled && configuredLevels && !saved.thinking) {
 					throw new Error(`The resumed session does not record a thinking level required by the current policy for "${saved.model}".`);
@@ -877,19 +952,11 @@ export default function (pi: ExtensionAPI) {
 					cwd: path.resolve(params.cwd ?? ctx.cwd),
 					model: selected.model,
 					thinking: selected.thinking ?? params.thinking,
-					tools: params.tools ? [...new Set(params.tools)] : inheritedTools,
+					tools: resolveChildTools(inheritedTools, params.tools),
 				};
 			}
 
-			const result = await runChild(
-				config,
-				params.task,
-				params.label,
-				params.timeoutMs,
-				resumePath,
-				signal,
-				onUpdate,
-			);
+			const result = await runChild(config, params.task, params.label, params.timeoutMs, resumePath, signal, onUpdate);
 			return {
 				content: [{ type: "text", text: modelFacingResult(result) }],
 				details: { result },
@@ -906,7 +973,7 @@ export default function (pi: ExtensionAPI) {
 				0,
 			);
 		},
-		renderResult(toolResult, { expanded }, theme) {
+		renderResult(toolResult, { expanded }, theme, context) {
 			const details = toolResult.details as SubagentDetails | undefined;
 			if (!details?.result) {
 				const content = toolResult.content[0];
@@ -923,11 +990,20 @@ export default function (pi: ExtensionAPI) {
 			const title = result.label ?? (result.resumed ? "resumed child" : "child");
 			const items = displayItems(result);
 
-			const timeout = timeoutBadge(result.timeoutMs);
+			// Tick the elapsed timer once a second while the child runs; results stored before
+			// startedAt existed have no timer to show.
+			const state = context.state as { ticker?: ReturnType<typeof setInterval> };
+			if (status === "running" && result.startedAt) state.ticker ??= setInterval(() => context.invalidate(), 1000);
+			else if (state.ticker) {
+				clearInterval(state.ticker);
+				state.ticker = undefined;
+			}
+			const timer = result.startedAt ? elapsedBadge(result) : timeoutBadge(result.timeoutMs);
+			const header = `${icon} ${theme.fg("toolTitle", theme.bold(title))}${timer ? ` ${theme.fg("dim", timer)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`;
 
 			if (!expanded) {
 				const recent = items.slice(-COLLAPSED_ITEM_COUNT);
-				let text = `${icon} ${theme.fg("toolTitle", theme.bold(title))}${timeout ? ` ${theme.fg("dim", timeout)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`;
+				let text = header;
 				if (items.length > recent.length) text += `\n${theme.fg("muted", `… ${items.length - recent.length} earlier items`)}`;
 				for (const item of recent) text += `\n${theme.fg(item.type === "toolResult" && item.isError ? "error" : "dim", compactItem(item))}`;
 				for (const activity of result.toolActivity.filter((item) => item.status === "running")) {
@@ -940,7 +1016,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const container = new Container();
-			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold(title))}${timeout ? ` ${theme.fg("dim", timeout)}` : ""} ${theme.fg(success ? "success" : "warning", status)}`, 0, 0));
+			container.addChild(new Text(header, 0, 0));
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(theme.fg("muted", "── Task ──"), 0, 0));
 			container.addChild(new Text(result.task, 0, 0));

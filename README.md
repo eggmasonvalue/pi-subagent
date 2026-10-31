@@ -39,7 +39,7 @@ Thin does not mean limited. Most useful subagent behavior falls out of a few com
 | Correction or follow-up | Resume the same persisted child session |
 | Interrupt recovery | Abort flushes partial output and preserves the session |
 | Human observability | Live TUI updates plus a durable session receipt |
-| Model and cost control | Per-run model, thinking, and tool configuration, with optional model/thinking policy and explicit tool inheritance or replacement |
+| Model and cost control | Per-run model, thinking, and tool configuration, with optional model/thinking policy and explicit tool inheritance, adjustment, or replacement |
 
 Together these cover the common delegation lifecycle without requiring background jobs, polling, mailboxes, workflow graphs, or a custom scheduler. The extension stays small while the parent model composes the primitives according to the task.
 
@@ -155,7 +155,7 @@ subagent {
 | `label` | Optional correlation label returned with the result. Useful when several sibling calls run concurrently. |
 | `model` | Pi model pattern or `provider/id` for a fresh run. With an enabled allowlist, it must exactly match an allowed ID. Omit it to use the policy default, or the child Pi default when policy is disabled. |
 | `thinking` | Reasoning level for a fresh run. It must be supported by the selected model and permitted by policy. When policy defines allowed levels, it is required and must match one of them; otherwise omission uses the child Pi default. |
-| `tools` | Tools for a fresh child. Omit to inherit the parent's active tools except `subagent` and `subagent_models`; `[]` disables tools; a non-empty array is the child's exact tool set. Add `subagent` alongside any other required tools only when the child must delegate further. |
+| `tools` | Tools for a fresh child. Omit to inherit the parent's active tools except `subagent` and `subagent_models`; `[]` disables tools; plain names are the child's exact tool set; a list of only `+name`/`-name` entries adds to or removes from the inherited set (`["-bash"]`, `["+subagent"]`). Add `subagent` only when the child must delegate further. |
 | `cwd` | Child working directory. Omit it to inherit the parent working directory. Setting it at startup controls path resolution and project-resource discovery. |
 | `timeoutMs` | Review horizon in milliseconds. No timeout is imposed when omitted. |
 | `resume` | Exact session JSONL path returned by an earlier call. Runtime configuration comes from the saved session. |
@@ -231,7 +231,7 @@ The zero-argument `subagent_models` tool returns the curated catalog on demand. 
 - optional user-written descriptions;
 - the configured model and thinking defaults.
 
-The parent should normally call it once when model choice matters and reuse that result for later delegations. The catalog is not injected into every system prompt.
+The parent should normally call it once when model choice matters and reuse that result for later delegations. The catalog is not injected into every system prompt. In the TUI, its row collapses to a one-line summary and any allowlist issues; expand it to see the full catalog.
 
 ### Configure the allowlist
 
@@ -287,6 +287,8 @@ When a non-empty `levels` object is present, `thinking` must match one of the ke
 
 If the allowlist file is absent, model policy is disabled and the child may use Pi's normal model configuration.
 
+An allowlist entry that names a model Pi no longer knows, or a level the model no longer supports, is reported by `subagent_models` but rejects only the calls that select it. A resume is rejected when its saved model has become unknown or is no longer permitted.
+
 ### Refresh optional benchmark data
 
 The refresh scripts always update the active policy at
@@ -313,7 +315,7 @@ Benchmark values inform model choice; Pi's model metadata remains authoritative 
 
 A child is a normal Pi process. It starts in the selected working directory and receives Pi's applicable project context and resources.
 
-Use `tools` to remove capabilities that are unnecessary for the delegated task. Omission inherits the parent's currently active tools except `subagent` and `subagent_models`; an empty array starts the child without tools; a non-empty array replaces inheritance and becomes the exact child tool set. The names must be tools available to the child Pi process.
+Use `tools` to remove capabilities that are unnecessary for the delegated task. Omission inherits the parent's currently active tools except `subagent` and `subagent_models`; an empty array starts the child without tools; plain names replace inheritance and become the exact child tool set; a list of only `+name`/`-name` entries adjusts the inherited set instead. The two forms cannot be mixed. The names must be tools available to the child Pi process.
 
 Recursive delegation is not enabled for children by default. Add `subagent` alongside any other required tools only when the child genuinely needs to orchestrate further isolated work. A list containing only `subagent` grants delegation but no file, shell, or editing tools.
 
@@ -347,6 +349,7 @@ During a run, Pi's tool row shows useful child activity without adding that stre
 
 - assistant progress;
 - tool calls;
+- elapsed time, against the timeout when one is set;
 - completion or failure state;
 - model and usage information;
 - session path.

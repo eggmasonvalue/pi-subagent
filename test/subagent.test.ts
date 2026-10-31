@@ -95,6 +95,63 @@ test("timeout returns streamed partial text and a resumable session", async (t) 
   assert.match(__testing.modelFacingResult(result), /partial checkpoint/);
 });
 
+test("a run that fails mid-stream keeps its streamed usage", async (t) => {
+  const agentDir = tempAgentDir();
+  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
+  const result = await __testing.runChild(
+    runConfig(process.cwd()),
+    "midstream-error",
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { agentDir, invoke: invocation },
+  );
+
+  assert.equal(__testing.statusOf(result), "failed");
+  assert.equal(result.usage.totalTokens, 18);
+  assert.equal(result.usage.cost.total, 0.033);
+});
+
+test("elapsed badge counts up while running and freezes at the end", () => {
+  const base: any = { startedAt: 1_000 };
+  assert.equal(__testing.elapsedBadge(base, 6_000), "[⏱ 5s]");
+  assert.equal(__testing.elapsedBadge({ ...base, timeoutMs: 120_000 }, 6_000), "[⏱ 5s / 2m]");
+  assert.equal(__testing.elapsedBadge({ ...base, endedAt: 3_000 }, 60_000), "[⏱ 2s]");
+});
+
+test("tools inherit, replace, or adjust the inherited set", () => {
+  const inherited = ["read", "bash", "edit"];
+  assert.deepEqual(__testing.resolveChildTools(inherited, undefined), inherited);
+  assert.deepEqual(__testing.resolveChildTools(inherited, []), []);
+  assert.deepEqual(__testing.resolveChildTools(inherited, ["read", "read"]), ["read"]);
+  assert.deepEqual(__testing.resolveChildTools(inherited, ["-bash", "+subagent"]), ["read", "edit", "subagent"]);
+  assert.throws(() => __testing.resolveChildTools(inherited, ["read", "-bash"]), /not a mix/);
+  assert.throws(() => __testing.resolveChildTools(inherited, ["+"]), /Invalid tools entry/);
+});
+
+test("a stale allowlist entry blocks only calls that use it", () => {
+  const policy: any = {
+    enabled: true,
+    allowed: new Set(["provider/model", "provider/retired"]),
+    metadata: new Map(),
+    defaultModel: "provider/model",
+    configPath: "policy.json",
+  };
+  const registry = { getAll: () => [{ provider: "provider", id: "model", reasoning: false }] } as any;
+  assert.deepEqual(__testing.resolveFreshModel(undefined, undefined, policy, registry), { model: "provider/model" });
+  assert.match(__testing.resolveFreshModel("provider/retired", undefined, policy, registry).error!, /not known to Pi/);
+});
+
+test("model catalog headline summarizes the policy", () => {
+  assert.equal(__testing.modelsHeadline({ allowlistEnabled: false, models: [] } as any), "allowlist not configured");
+  assert.equal(
+    __testing.modelsHeadline({ allowlistEnabled: true, default: "p/m", defaultThinking: "high", models: [[], []] } as any),
+    "2 models, default: p/m (high)",
+  );
+});
+
 test("formats timeout badges compactly for the human-facing UI", () => {
   assert.equal(__testing.timeoutBadge(undefined), "");
   assert.equal(__testing.timeoutBadge(750), "[⏱ 750ms]");

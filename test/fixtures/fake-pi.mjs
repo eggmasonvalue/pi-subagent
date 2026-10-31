@@ -60,8 +60,9 @@ if (task.includes("hang")) {
     provider: "test-provider",
     model: "test-model",
     api: "openai-responses",
-    usage,
-    stopReason: "stop",
+    // A provider failure can end the turn without usage after usage was already streamed.
+    usage: task.includes("midstream-error") ? undefined : usage,
+    stopReason: task.includes("midstream-error") ? "error" : "stop",
     timestamp: Date.now(),
   };
   fs.appendFileSync(sessionFile, `${JSON.stringify({ type: "message", id: "message1", parentId: null, timestamp: new Date().toISOString(), message })}\n`);
