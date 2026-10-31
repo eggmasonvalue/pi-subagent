@@ -12,14 +12,15 @@ const sessionDir = valueAfter("--session-dir");
 let task = "";
 for await (const chunk of process.stdin) task += chunk.toString();
 let sessionFile = resume;
-if (!sessionFile) {
+const createSessionFile = () => {
+  if (sessionFile) return;
   fs.mkdirSync(sessionDir, { recursive: true });
   sessionFile = path.join(sessionDir, "fake-session.jsonl");
   fs.writeFileSync(
     sessionFile,
     `${JSON.stringify({ type: "session", version: 3, id: "fake-session", timestamp: new Date().toISOString(), cwd: process.cwd() })}\n`,
   );
-}
+};
 
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
 const emitUtf8Split = (event) => {
@@ -40,6 +41,8 @@ const usage = {
 };
 
 emit({ type: "session", version: 3, id: "fake-session", timestamp: new Date().toISOString(), cwd: process.cwd() });
+// Like Pi, the session file appears only once the first message is persisted, after the session event.
+createSessionFile();
 emit({ type: "message_start", message: { role: "assistant", content: [] } });
 const streamedText = task.includes("hang") ? "partial checkpoint" : task.includes("unicode") ? "नमस्ते🙂" : "finished";
 const update = { type: "message_update", usage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: streamedText } };
@@ -60,8 +63,9 @@ if (task.includes("hang")) {
     provider: "test-provider",
     model: "test-model",
     api: "openai-responses",
-    usage,
-    stopReason: "stop",
+    // A provider failure can end the turn without usage after usage was already streamed.
+    usage: task.includes("midstream-error") ? undefined : usage,
+    stopReason: task.includes("midstream-error") ? "error" : "stop",
     timestamp: Date.now(),
   };
   fs.appendFileSync(sessionFile, `${JSON.stringify({ type: "message", id: "message1", parentId: null, timestamp: new Date().toISOString(), message })}\n`);

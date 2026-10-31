@@ -17,15 +17,21 @@ function runConfig(cwd: string) {
   return { cwd, model: undefined, thinking: "low", tools: ["read", "bash"] };
 }
 
-test("registers the minimal two-tool surface with parent guidance", () => {
+test("registers the minimal two-tool surface with parent guidance and the human-only viewer", () => {
   const tools: any[] = [];
+  const commands: string[] = [];
   registerSubagent({
     registerTool(tool: any) {
       tools.push(tool);
     },
+    registerCommand(name: string) {
+      commands.push(name);
+    },
+    on() {},
   } as any);
 
   assert.deepEqual(tools.map((tool) => tool.name), ["subagent_models", "subagent"]);
+  assert.deepEqual(commands, ["subagents"]);
   assert.deepEqual(Object.keys(tools[0].parameters.properties), []);
   assert.deepEqual(Object.keys(tools[1].parameters.properties), [
     "task",
@@ -93,6 +99,79 @@ test("timeout returns streamed partial text and a resumable session", async (t) 
   assert.ok(result.sessionFile && fs.existsSync(result.sessionFile));
   assert.match(__testing.modelFacingResult(result), /status=timeout/);
   assert.match(__testing.modelFacingResult(result), /partial checkpoint/);
+});
+
+test("a run that fails mid-stream keeps its streamed usage", async (t) => {
+  const agentDir = tempAgentDir();
+  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
+  const result = await __testing.runChild(
+    runConfig(process.cwd()),
+    "midstream-error",
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { agentDir, invoke: invocation },
+  );
+
+  assert.equal(__testing.statusOf(result), "failed");
+  assert.equal(result.usage.totalTokens, 18);
+  assert.equal(result.usage.cost.total, 0.033);
+});
+
+test("elapsed badge counts up while running and freezes at the end", () => {
+  const base: any = { startedAt: 1_000 };
+  assert.equal(__testing.elapsedBadge(base, 6_000), "[⏱ 5s]");
+  assert.equal(__testing.elapsedBadge({ ...base, timeoutMs: 120_000 }, 6_000), "[⏱ 5s / 2m]");
+  assert.equal(__testing.elapsedBadge({ ...base, endedAt: 3_000 }, 60_000), "[⏱ 2s]");
+});
+
+test("tools inherit, replace, or adjust the inherited set", () => {
+  const inherited = ["read", "bash", "edit"];
+  assert.deepEqual(__testing.resolveChildTools(inherited, undefined), inherited);
+  assert.deepEqual(__testing.resolveChildTools(inherited, []), []);
+  assert.deepEqual(__testing.resolveChildTools(inherited, ["read", "read"]), ["read"]);
+  assert.deepEqual(__testing.resolveChildTools(inherited, ["-bash", "+subagent"]), ["read", "edit", "subagent"]);
+  assert.throws(() => __testing.resolveChildTools(inherited, ["read", "-bash"]), /not a mix/);
+  assert.throws(() => __testing.resolveChildTools(inherited, ["+"]), /Invalid tools entry/);
+});
+
+test("the label is persisted with the child so resumes carry it", async (t) => {
+  const agentDir = tempAgentDir();
+  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
+  const result = await __testing.runChild(
+    runConfig(process.cwd()),
+    "finish",
+    "auth-audit",
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { agentDir, invoke: invocation },
+  );
+  assert.equal(__testing.readChildMetadata(result.sessionFile!).label, "auth-audit");
+});
+
+test("a stale allowlist entry blocks only calls that use it", () => {
+  const policy: any = {
+    enabled: true,
+    allowed: new Set(["provider/model", "provider/retired"]),
+    metadata: new Map(),
+    defaultModel: "provider/model",
+    configPath: "policy.json",
+  };
+  const registry = { getAll: () => [{ provider: "provider", id: "model", reasoning: false }] } as any;
+  assert.deepEqual(__testing.resolveFreshModel(undefined, undefined, policy, registry), { model: "provider/model" });
+  assert.match(__testing.resolveFreshModel("provider/retired", undefined, policy, registry).error!, /not known to Pi/);
+});
+
+test("model catalog headline summarizes the policy", () => {
+  assert.equal(__testing.modelsHeadline({ allowlistEnabled: false, models: [] } as any), "allowlist not configured");
+  assert.equal(
+    __testing.modelsHeadline({ allowlistEnabled: true, default: "p/m", defaultThinking: "high", models: [[], []] } as any),
+    "2 models, default: p/m (high)",
+  );
 });
 
 test("formats timeout badges compactly for the human-facing UI", () => {
@@ -195,6 +274,7 @@ test("live tool execution events are surfaced in updates", async (t) => {
   const agentDir = tempAgentDir();
   t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
   const states: string[][] = [];
+  const sessionsWhileRunning: (string | undefined)[] = [];
   const result = await __testing.runChild(
     runConfig(process.cwd()),
     "activity",
@@ -202,12 +282,17 @@ test("live tool execution events are surfaced in updates", async (t) => {
     undefined,
     undefined,
     undefined,
-    (partial: any) => states.push(partial.details.result.toolActivity.map((item: any) => item.status)),
+    (partial: any) => {
+      states.push(partial.details.result.toolActivity.map((item: any) => item.status));
+      if (partial.details.result.exitCode === -1) sessionsWhileRunning.push(partial.details.result.sessionFile);
+    },
     { agentDir, invoke: invocation },
   );
 
   assert.ok(states.some((state) => state.includes("running")));
   assert.equal(result.toolActivity[0].status, "done");
+  // The session file appears after the session event; a running child must still expose it.
+  assert.ok(sessionsWhileRunning.some((file) => file === result.sessionFile));
 });
 
 test("task text is transported over stdin and UTF-8 chunks are decoded safely", async (t) => {
@@ -327,6 +412,7 @@ test("model-facing envelope keeps orchestration fields and excludes accounting d
     timeoutMs: 1000,
     exitCode: 0,
     model: "provider/model",
+    contextWindow: 200_000,
     thinking: "high",
     stopReason: "stop",
     sessionFile: "/tmp/child.jsonl",
@@ -334,10 +420,12 @@ test("model-facing envelope keeps orchestration fields and excludes accounting d
     messages: [],
     partialText: "finished",
     stderr: "",
-    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 }, turns: 3 },
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 84_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 }, turns: 3 },
   };
   const output = __testing.modelFacingResult(result);
-  assert.match(output, /^\[label=parallel-a status=done session=\/tmp\/child\.jsonl\]/);
+  assert.match(output, /^\[label=parallel-a status=done context=42%\/200k session=\/tmp\/child\.jsonl\]/);
+  assert.match(__testing.envelope({ ...result, contextWindow: undefined }), /context=84k /);
+  assert.doesNotMatch(__testing.envelope({ ...result, usage: { ...result.usage, totalTokens: 0 } }), /context=/);
   assert.doesNotMatch(output, /model=|thinking=|turns=|cost=|timeoutMs=|resumed=|exit=/);
 });
 

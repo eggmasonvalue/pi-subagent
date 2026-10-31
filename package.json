@@ -1,8 +1,8 @@
 {
   "name": "@eggmasonvalue/pi-subagent",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
-  "description": "Thin Pi subagent primitive: one synchronous call for isolated context, live progress, timeout supervision, resumable sessions, and per-task model/tool control.",
+  "description": "Thin Pi subagent primitive: one synchronous call for isolated context, live progress, timeout supervision, resumable sessions, and per-task model/tool control, plus a live /subagents transcript browser.",
   "keywords": [
     "pi-package",
     "pi",
