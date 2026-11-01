@@ -35,27 +35,37 @@ import {
 import { type Component, Container, Key, Markdown, matchesKey, SelectList, Spacer, stripTerminalSequences, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import type { SubagentResult } from "./index.ts";
 
-/** Running subagent calls, keyed by tool call id. The same result objects the tool mutates. */
+/**
+ * Subagent calls this process has run, keyed by tool call id, holding the same result objects the
+ * tool mutates. Pi persists the results of sibling calls only once the whole batch finishes, so a
+ * finished call stays here until its result appears on the branch.
+ */
 export class LiveRuns {
-	private readonly runs = new Map<string, SubagentResult>();
+	private readonly runs = new Map<string, { result: SubagentResult; running: boolean }>();
 	private readonly listeners = new Set<() => void>();
 
 	update(toolCallId: string, result: SubagentResult): void {
-		this.runs.set(toolCallId, result);
+		this.runs.set(toolCallId, { result, running: true });
 		this.emit();
 	}
 
 	end(toolCallId: string): void {
-		this.runs.delete(toolCallId);
+		const run = this.runs.get(toolCallId);
+		if (run) run.running = false;
 		this.emit();
 	}
 
-	values(): IterableIterator<SubagentResult> {
-		return this.runs.values();
+	/** Drop a call whose result is now persisted on the branch. */
+	forget(toolCallId: string): void {
+		this.runs.delete(toolCallId);
+	}
+
+	entries(): IterableIterator<[string, { result: SubagentResult; running: boolean }]> {
+		return this.runs.entries();
 	}
 
 	isRunning(sessionFile: string): boolean {
-		for (const result of this.runs.values()) if (result.sessionFile === sessionFile) return true;
+		for (const run of this.runs.values()) if (run.running && run.result.sessionFile === sessionFile) return true;
 		return false;
 	}
 
@@ -104,12 +114,26 @@ function listChildren(branch: SessionEntry[], runs: LiveRuns): Child[] {
 			order,
 		});
 	};
+	const calls = new Set<string>();
+	const persisted = new Set<string>();
 	for (const entry of branch) {
-		if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "subagent") continue;
-		const result = (entry.message.details as { result?: SubagentResult } | undefined)?.result;
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role === "assistant") {
+			for (const part of message.content) if (part.type === "toolCall" && part.name === "subagent") calls.add(part.id);
+		}
+		if (message.role !== "toolResult" || message.toolName !== "subagent") continue;
+		persisted.add(message.toolCallId);
+		const result = (message.details as { result?: SubagentResult } | undefined)?.result;
 		if (result) record(result, false, Date.parse(entry.timestamp));
 	}
-	for (const result of runs.values()) record(result, true, Number.POSITIVE_INFINITY);
+	// The branch carries a call as soon as the assistant message issuing it is persisted, before the
+	// call runs; its result follows once the whole sibling batch finishes. Until then the registry
+	// is the only record. Calls not on this branch belong to another branch or session.
+	for (const [toolCallId, { result, running }] of runs.entries()) {
+		if (persisted.has(toolCallId)) runs.forget(toolCallId);
+		else if (calls.has(toolCallId)) record(result, running, running ? Number.POSITIVE_INFINITY : (result.endedAt ?? 0));
+	}
 	return [...children.values()].sort((a, b) => b.order - a.order);
 }
 
