@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { __testing, LiveRuns } from "../extensions/subagent/viewer.ts";
+import { __testing, LiveRuns, RUN_ENTRY_TYPE } from "../extensions/subagent/viewer.ts";
 
 const result = (overrides: Record<string, unknown>): any => ({
   task: "task",
@@ -19,30 +19,31 @@ const result = (overrides: Record<string, unknown>): any => ({
   ...overrides,
 });
 
-const toolResultEntry = (id: string, timestamp: string, details: unknown): any => ({
-  type: "message",
-  id,
+const runEntry = (timestamp: string, summary: Record<string, unknown>): any => ({
+  type: "custom",
+  customType: RUN_ENTRY_TYPE,
+  id: `run-${timestamp}`,
   parentId: null,
   timestamp,
-  message: { role: "toolResult", toolName: "subagent", toolCallId: id, content: [], details, isError: false },
+  data: result(summary),
 });
 
-const callsEntry = (ids: string[]): any => ({
+const callsEntry = (ids: string[], name = "subagent"): any => ({
   type: "message",
   id: `calls-${ids.join("-")}`,
   parentId: null,
   timestamp: "2026-01-01T00:00:00Z",
-  message: { role: "assistant", content: ids.map((id) => ({ type: "toolCall", id, name: "subagent", arguments: {} })) },
+  message: { role: "assistant", content: ids.map((id) => ({ type: "toolCall", id, name, arguments: {} })) },
 });
 
 test("children are one row per session, running first, carrying their original label and task", () => {
   const runs = new LiveRuns();
   const branch = [
     callsEntry(["a", "b"]),
-    toolResultEntry("a", "2026-01-01T00:00:00Z", { result: result({ sessionFile: "/a.jsonl", label: "audit", task: "audit auth" }) }),
-    toolResultEntry("b", "2026-01-01T00:01:00Z", { result: result({ sessionFile: "/b.jsonl", task: "map tests" }) }),
+    runEntry("2026-01-01T00:00:00Z", { sessionFile: "/a.jsonl", label: "audit", task: "audit auth" }),
+    runEntry("2026-01-01T00:01:00Z", { sessionFile: "/b.jsonl", task: "map tests" }),
     callsEntry(["c", "live"]),
-    toolResultEntry("c", "2026-01-01T00:02:00Z", { result: result({ sessionFile: "/a.jsonl", resumed: true, task: "continue" }) }),
+    runEntry("2026-01-01T00:02:00Z", { sessionFile: "/a.jsonl", resumed: true, task: "continue" }),
     { type: "message", id: "d", parentId: null, timestamp: "2026-01-01T00:03:00Z", message: { role: "user", content: "hi" } },
   ];
   runs.update("live", result({ sessionFile: "/c.jsonl", task: "live work", exitCode: -1 }));
@@ -55,26 +56,19 @@ test("children are one row per session, running first, carrying their original l
   assert.equal(children[1].result.task, "continue");
 });
 
-test("a finished sibling stays listed until Pi persists the batch's results", () => {
+test("children started by a codemode script are listed under the script's call", () => {
   const runs = new LiveRuns();
-  const branch = [callsEntry(["fast", "slow"])];
-  runs.update("fast", result({ sessionFile: "/fast.jsonl", label: "fast", exitCode: -1 }));
-  runs.update("slow", result({ sessionFile: "/slow.jsonl", label: "slow", exitCode: -1 }));
-  runs.update("elsewhere", result({ sessionFile: "/other.jsonl", exitCode: -1 }));
-  runs.end("fast");
+  const branch = [callsEntry(["script"], "codemode")];
+  runs.update("script/1", result({ sessionFile: "/one.jsonl", label: "one", exitCode: -1 }));
+  runs.update("script/2", result({ sessionFile: "/two.jsonl", label: "two", exitCode: -1 }));
+  runs.update("elsewhere/1", result({ sessionFile: "/other.jsonl", exitCode: -1 }));
+  assert.deepEqual(__testing.listChildren(branch, runs).map((child) => child.label).sort(), ["one", "two"]);
 
-  const during = __testing.listChildren(branch, runs);
-  assert.deepEqual(during.map((child) => [child.label, child.running]), [["slow", true], ["fast", false]]);
-  assert.equal(runs.isRunning("/fast.jsonl"), false);
-
-  runs.end("slow");
-  const persisted = [
-    ...branch,
-    toolResultEntry("fast", "2026-01-01T00:05:00Z", { result: result({ sessionFile: "/fast.jsonl", label: "fast" }) }),
-    toolResultEntry("slow", "2026-01-01T00:05:00Z", { result: result({ sessionFile: "/slow.jsonl", label: "slow" }) }),
-  ];
-  assert.equal(__testing.listChildren(persisted, runs).length, 2);
-  assert.deepEqual([...runs.entries()].map(([id]) => id), ["elsewhere"]);
+  // A finished call leaves the registry; its custom entry takes over.
+  runs.end("script/1");
+  const persisted = [...branch, runEntry("2026-01-01T00:05:00Z", { sessionFile: "/one.jsonl", label: "one" })];
+  assert.deepEqual(__testing.listChildren(persisted, runs).map((child) => [child.label, child.running]), [["two", true], ["one", false]]);
+  assert.equal(runs.isRunning("/one.jsonl"), false);
 });
 
 test("a session branch follows parent links from the last entry", () => {
@@ -108,8 +102,8 @@ test("transcript renders a child session, strips terminal sequences, and tails a
   const child = __testing.listChildren([callsEntry(["call"])], runs)[0];
   const tui: any = { terminal: { rows: 40 }, requestRender() {} };
   const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-  const keybindings: any = { matches: () => false };
-  const deps: any = { runs, statusOf: () => "running", summarize: () => "running", toolDefinitions: {} };
+  const keybindings: any = { matches: () => false, getKeys: (id: string) => (id === "app.tools.expand" ? ["ctrl+o"] : []) };
+  const deps: any = { runs, toolDefinitions: {} };
   const transcript = new __testing.Transcript(child, tui, theme, keybindings, deps, directory, () => {});
   t.after(() => transcript.dispose());
 
@@ -120,6 +114,7 @@ test("transcript renders a child session, strips terminal sequences, and tails a
   assert.match(first, /still thinking/);
   assert.doesNotMatch(first, /\x1b\]/);
   assert.match(first, /Took 1\.2s/);
+  assert.match(first, /ctrl\+o expand/);
   assert.equal(transcript.render(100).length, 40);
 
   fs.appendFileSync(file, line({ type: "message", id: "a2", parentId: "r1", timestamp: now, message: { role: "assistant", content: [{ type: "text", text: "found the readme" }], provider: "p", model: "m", api: "openai-responses", usage, stopReason: "stop", timestamp: Date.now() } }));

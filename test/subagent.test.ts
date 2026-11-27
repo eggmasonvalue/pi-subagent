@@ -4,452 +4,204 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
+import {
+  envelope,
+  formatDuration,
+  modelFacingResult,
+  readChildMetadata,
+  type RunRequest,
+  runChild,
+  statusOf,
+  structuredResult,
+} from "../extensions/subagent/child.ts";
 import registerSubagent, { __testing } from "../extensions/subagent/index.ts";
 
 const fixture = path.resolve("test/fixtures/fake-pi.mjs");
 const invocation = (args: string[]) => ({ command: process.execPath, args: [fixture, ...args] });
 
-function tempAgentDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-test-"));
+function run(t: test.TestContext, request: Partial<RunRequest> & { task: string }, invoke = invocation) {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-test-"));
+  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
+  return runChild({ config: { cwd: process.cwd(), thinking: "low", tools: ["read", "bash"] }, ...request }, { agentDir, invoke });
 }
 
-function runConfig(cwd: string) {
-  return { cwd, model: undefined, thinking: "low", tools: ["read", "bash"] };
-}
+const usage = (totalTokens: number, cost = 0) => ({
+  input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost }, turns: 1,
+});
 
-test("registers the minimal two-tool surface with parent guidance and the human-only viewer", () => {
+test("registers two codemode-ready tools with parent guidance and the human-only viewer", () => {
   const tools: any[] = [];
   const commands: string[] = [];
   registerSubagent({
-    registerTool(tool: any) {
-      tools.push(tool);
-    },
-    registerCommand(name: string) {
-      commands.push(name);
-    },
+    registerTool: (tool: any) => tools.push(tool),
+    registerCommand: (name: string) => commands.push(name),
     on() {},
   } as any);
 
   assert.deepEqual(tools.map((tool) => tool.name), ["subagent_models", "subagent"]);
   assert.deepEqual(commands, ["subagents"]);
-  assert.deepEqual(Object.keys(tools[0].parameters.properties), []);
-  assert.deepEqual(Object.keys(tools[1].parameters.properties), [
-    "task",
-    "label",
-    "model",
-    "thinking",
-    "tools",
-    "cwd",
-    "timeoutMs",
-    "resume",
-  ]);
-  assert.ok(tools[0].promptSnippet.includes("accepted by subagent"));
-  assert.ok(tools[1].promptSnippet.includes("resumable Pi session"));
+  assert.deepEqual(Object.keys(tools[1].parameters.properties), ["task", "label", "model", "thinking", "tools", "cwd", "timeoutMs", "resume"]);
+  assert.deepEqual(Object.keys(tools[1].outputSchema.properties), ["status", "output", "error", "label", "session", "contextTokens", "contextWindow"]);
+  assert.ok(tools[0].outputSchema.properties.models);
   assert.ok(tools[1].promptGuidelines.some((line: string) => line.includes("supervision checkpoint")));
-  assert.ok(tools[1].promptGuidelines.some((line: string) => line.includes("concurrently")));
+  assert.ok(tools[1].promptGuidelines.some((line: string) => line.includes("Promise.all")));
+  assert.deepEqual(tools[1].parameters.properties.thinking.enum, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   assert.equal(Value.Check(tools[1].parameters, { task: "valid", thinking: "high" }), true);
   assert.equal(Value.Check(tools[1].parameters, { task: "valid", thinking: "invalid" }), false);
   assert.equal(Value.Check(tools[1].parameters, { task: "valid", resume: "" }), false);
 });
 
 test("fresh child streams, persists runtime metadata, and reports usage", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
   const updates: string[] = [];
-  const result = await __testing.runChild(
-    runConfig(process.cwd()),
-    "finish",
-    "smoke",
-    undefined,
-    undefined,
-    undefined,
-    (partial: any) => updates.push(partial.content[0].text),
-    { agentDir, invoke: invocation },
-  );
+  const result = await run(t, { task: "finish", label: "smoke", onUpdate: (live) => updates.push(live.partialText) });
 
-  assert.equal(__testing.statusOf(result), "done");
+  assert.equal(statusOf(result), "done");
   assert.equal(result.model, "test-provider/test-model");
   assert.equal(result.usage.turns, 1);
   assert.equal(result.usage.cost.total, 0.033);
   assert.ok(updates.includes("finished"));
   assert.ok(result.sessionFile && fs.existsSync(result.sessionFile));
-  const metadata = __testing.readChildMetadata(result.sessionFile!);
+  const metadata = readChildMetadata(result.sessionFile!);
   assert.deepEqual(metadata.tools, ["read", "bash"]);
   assert.equal(metadata.thinking, "low");
+  assert.equal(metadata.label, "smoke");
 });
 
 test("timeout returns streamed partial text and a resumable session", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  const result = await __testing.runChild(
-    runConfig(process.cwd()),
-    "hang",
-    undefined,
-    500,
-    undefined,
-    undefined,
-    undefined,
-    { agentDir, invoke: invocation },
-  );
+  const result = await run(t, { task: "hang", timeoutMs: 500 });
 
-  assert.equal(__testing.statusOf(result), "timeout");
+  assert.equal(statusOf(result), "timeout");
   assert.equal(result.partialText, "partial checkpoint");
-  assert.equal(result.usage.turns, 1);
   assert.equal(result.usage.cost.total, 0.033);
   assert.ok(result.sessionFile && fs.existsSync(result.sessionFile));
-  assert.match(__testing.modelFacingResult(result), /status=timeout/);
-  assert.match(__testing.modelFacingResult(result), /partial checkpoint/);
+  assert.match(modelFacingResult(result), /status=timeout/);
+  assert.match(modelFacingResult(result), /partial checkpoint/);
+  assert.deepEqual(structuredResult(result), {
+    status: "timeout",
+    output: "partial checkpoint",
+    session: result.sessionFile,
+    contextTokens: 18,
+  });
+});
+
+test("abort returns partial text instead of throwing", async (t) => {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 500);
+  const result = await run(t, { task: "hang", signal: controller.signal });
+
+  assert.equal(statusOf(result), "aborted");
+  assert.equal(result.partialText, "partial checkpoint");
+  assert.ok(result.sessionFile && fs.existsSync(result.sessionFile));
 });
 
 test("a run that fails mid-stream keeps its streamed usage", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  const result = await __testing.runChild(
-    runConfig(process.cwd()),
-    "midstream-error",
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    { agentDir, invoke: invocation },
-  );
-
-  assert.equal(__testing.statusOf(result), "failed");
+  const result = await run(t, { task: "midstream-error" });
+  assert.equal(statusOf(result), "failed");
   assert.equal(result.usage.totalTokens, 18);
   assert.equal(result.usage.cost.total, 0.033);
 });
 
-test("elapsed badge counts up while running and freezes at the end", () => {
-  const base: any = { startedAt: 1_000 };
-  assert.equal(__testing.elapsedBadge(base, 6_000), "[⏱ 5s]");
-  assert.equal(__testing.elapsedBadge({ ...base, timeoutMs: 120_000 }, 6_000), "[⏱ 5s / 2m]");
-  assert.equal(__testing.elapsedBadge({ ...base, endedAt: 3_000 }, 60_000), "[⏱ 2s]");
+test("a child that exits non-zero fails and reports its stderr to scripts", async (t) => {
+  const result = await run(t, { task: "crash" });
+  assert.equal(statusOf(result), "failed");
+  assert.match(structuredResult(result).error ?? "", /boom/);
+});
+
+test("resume keeps the session and saved runtime configuration", async (t) => {
+  const first = await run(t, { task: "finish" });
+  const { version: _, label: __, ...saved } = readChildMetadata(first.sessionFile!);
+  let args: string[] = [];
+  const resumed = await run(t, { config: saved, task: "continue", resume: first.sessionFile }, (childArgs) => {
+    args = childArgs;
+    return invocation(childArgs);
+  });
+
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.sessionFile, first.sessionFile);
+  assert.equal(args[args.indexOf("--model") + 1], "test-provider/test-model");
+  assert.equal(args[args.indexOf("--thinking") + 1], "low");
+  assert.equal(args[args.indexOf("--tools") + 1], "read,bash");
+  assert.match(modelFacingResult(resumed), /resumed result/);
+});
+
+test("recursive delegation is loaded only when explicitly requested", async (t) => {
+  let args: string[] = [];
+  await run(t, { config: { cwd: process.cwd(), tools: ["subagent"] }, task: "finish" }, (childArgs) => {
+    args = childArgs;
+    return invocation(childArgs);
+  });
+  assert.ok(args.includes("--extension"));
+  assert.equal(args[args.indexOf("--tools") + 1], "subagent");
+});
+
+test("live tool execution events and the session path surface while running", async (t) => {
+  const states: string[][] = [];
+  const sessions: (string | undefined)[] = [];
+  const result = await run(t, {
+    task: "activity",
+    onUpdate(live) {
+      states.push(live.toolActivity.map((item) => item.status));
+      if (live.exitCode === -1) sessions.push(live.sessionFile);
+    },
+  });
+  assert.ok(states.some((state) => state.includes("running")));
+  assert.equal(result.toolActivity[0].status, "done");
+  assert.ok(sessions.includes(result.sessionFile));
+});
+
+test("task text is transported over stdin and UTF-8 chunks are decoded safely", async (t) => {
+  for (const task of ["--looks-like-a-flag", "@looks-like-a-file", "unicode"]) {
+    let args: string[] = [];
+    const result = await run(t, { task }, (childArgs) => {
+      args = childArgs;
+      return invocation(childArgs);
+    });
+    assert.equal(args.includes(task), false);
+    assert.equal(statusOf(result), "done");
+    if (task === "unicode") assert.match(modelFacingResult(result), /नमस्ते🙂/);
+  }
 });
 
 test("tools inherit, replace, or adjust the inherited set", () => {
   const inherited = ["read", "bash", "edit"];
-  assert.deepEqual(__testing.resolveChildTools(inherited, undefined), inherited);
-  assert.deepEqual(__testing.resolveChildTools(inherited, []), []);
-  assert.deepEqual(__testing.resolveChildTools(inherited, ["read", "read"]), ["read"]);
-  assert.deepEqual(__testing.resolveChildTools(inherited, ["-bash", "+subagent"]), ["read", "edit", "subagent"]);
-  assert.throws(() => __testing.resolveChildTools(inherited, ["read", "-bash"]), /not a mix/);
-  assert.throws(() => __testing.resolveChildTools(inherited, ["+"]), /Invalid tools entry/);
+  const resolve = __testing.resolveChildTools;
+  assert.deepEqual(resolve(inherited, undefined), inherited);
+  assert.deepEqual(resolve(inherited, []), []);
+  assert.deepEqual(resolve(inherited, ["read", "read"]), ["read"]);
+  assert.deepEqual(resolve(inherited, ["-bash", "+subagent"]), ["read", "edit", "subagent"]);
+  assert.throws(() => resolve(inherited, ["read", "-bash"]), /not a mix/);
+  assert.throws(() => resolve(inherited, ["+"]), /Invalid tools entry/);
 });
 
-test("the label is persisted with the child so resumes carry it", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  const result = await __testing.runChild(
-    runConfig(process.cwd()),
-    "finish",
-    "auth-audit",
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    { agentDir, invoke: invocation },
-  );
-  assert.equal(__testing.readChildMetadata(result.sessionFile!).label, "auth-audit");
+test("durations and elapsed badges are compact", () => {
+  assert.deepEqual([750, 1_500, 59_960, 125_000, 3_599_000, 3_900_000].map(formatDuration), ["750ms", "1.5s", "1m", "2m 5s", "59m 59s", "1h 5m"]);
+  assert.equal(__testing.elapsedBadge({ startedAt: 1_000 }, 6_000), "[⏱ 5s]");
+  assert.equal(__testing.elapsedBadge({ startedAt: 1_000, timeoutMs: 120_000 }, 6_000), "[⏱ 5s / 2m]");
+  assert.equal(__testing.elapsedBadge({ startedAt: 1_000, endedAt: 3_000 }, 60_000), "[⏱ 2s]");
 });
 
-test("a stale allowlist entry blocks only calls that use it", () => {
-  const policy: any = {
-    enabled: true,
-    allowed: new Set(["provider/model", "provider/retired"]),
-    metadata: new Map(),
-    defaultModel: "provider/model",
-    configPath: "policy.json",
-  };
-  const registry = { getAll: () => [{ provider: "provider", id: "model", reasoning: false }] } as any;
-  assert.deepEqual(__testing.resolveFreshModel(undefined, undefined, policy, registry), { model: "provider/model" });
-  assert.match(__testing.resolveFreshModel("provider/retired", undefined, policy, registry).error!, /not known to Pi/);
-});
-
-test("model catalog headline summarizes the policy", () => {
-  assert.equal(__testing.modelsHeadline({ allowlistEnabled: false, models: [] } as any), "allowlist not configured");
-  assert.equal(
-    __testing.modelsHeadline({ allowlistEnabled: true, default: "p/m", defaultThinking: "high", models: [[], []] } as any),
-    "2 models, default: p/m (high)",
-  );
-});
-
-test("formats timeout badges compactly for the human-facing UI", () => {
-  assert.equal(__testing.timeoutBadge(undefined), "");
-  assert.equal(__testing.timeoutBadge(750), "[⏱ 750ms]");
-  assert.equal(__testing.timeoutBadge(1_500), "[⏱ 1.5s]");
-  assert.equal(__testing.timeoutBadge(125_000), "[⏱ 2m 5s]");
-  assert.equal(__testing.timeoutBadge(3_900_000), "[⏱ 1h 5m]");
-});
-
-test("abort returns partial text instead of throwing", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(), 500);
-  const result = await __testing.runChild(
-    runConfig(process.cwd()),
-    "hang",
-    undefined,
-    undefined,
-    undefined,
-    controller.signal,
-    undefined,
-    { agentDir, invoke: invocation },
-  );
-
-  assert.equal(__testing.statusOf(result), "aborted");
-  assert.equal(result.partialText, "partial checkpoint");
-  assert.equal(result.usage.turns, 1);
-  assert.equal(result.usage.cost.total, 0.033);
-  assert.ok(result.sessionFile && fs.existsSync(result.sessionFile));
-});
-
-test("resume keeps the session and saved runtime configuration", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  const first = await __testing.runChild(
-    runConfig(process.cwd()),
-    "finish",
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    { agentDir, invoke: invocation },
-  );
-  const saved = __testing.readChildMetadata(first.sessionFile!);
-  let resumedArgs: string[] = [];
-  const resumed = await __testing.runChild(
-    saved,
-    "continue",
-    undefined,
-    undefined,
-    first.sessionFile,
-    undefined,
-    undefined,
-    {
-      agentDir,
-      invoke: (args) => {
-        resumedArgs = args;
-        return invocation(args);
-      },
-    },
-  );
-
-  assert.equal(resumed.resumed, true);
-  assert.equal(resumed.sessionFile, first.sessionFile);
-  assert.equal(resumedArgs[resumedArgs.indexOf("--model") + 1], "test-provider/test-model");
-  assert.equal(resumedArgs[resumedArgs.indexOf("--thinking") + 1], "low");
-  assert.equal(resumedArgs[resumedArgs.indexOf("--tools") + 1], "read,bash");
-  assert.match(__testing.modelFacingResult(resumed), /resumed result/);
-});
-
-test("recursive delegation is loaded only when explicitly requested", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  let childArgs: string[] = [];
-  await __testing.runChild(
-    { cwd: process.cwd(), model: undefined, thinking: undefined, tools: ["subagent"] },
-    "finish",
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    {
-      agentDir,
-      invoke: (args) => {
-        childArgs = args;
-        return invocation(args);
-      },
-    },
-  );
-
-  assert.ok(childArgs.includes("--extension"));
-  assert.equal(childArgs[childArgs.indexOf("--tools") + 1], "subagent");
-});
-
-test("live tool execution events are surfaced in updates", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  const states: string[][] = [];
-  const sessionsWhileRunning: (string | undefined)[] = [];
-  const result = await __testing.runChild(
-    runConfig(process.cwd()),
-    "activity",
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    (partial: any) => {
-      states.push(partial.details.result.toolActivity.map((item: any) => item.status));
-      if (partial.details.result.exitCode === -1) sessionsWhileRunning.push(partial.details.result.sessionFile);
-    },
-    { agentDir, invoke: invocation },
-  );
-
-  assert.ok(states.some((state) => state.includes("running")));
-  assert.equal(result.toolActivity[0].status, "done");
-  // The session file appears after the session event; a running child must still expose it.
-  assert.ok(sessionsWhileRunning.some((file) => file === result.sessionFile));
-});
-
-test("task text is transported over stdin and UTF-8 chunks are decoded safely", async (t) => {
-  const agentDir = tempAgentDir();
-  t.after(() => fs.rmSync(agentDir, { recursive: true, force: true }));
-  for (const task of ["--looks-like-a-flag", "@looks-like-a-file", "unicode"]) {
-    let childArgs: string[] = [];
-    const result = await __testing.runChild(
-      runConfig(process.cwd()),
-      task,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      {
-        agentDir,
-        invoke: (args) => {
-          childArgs = args;
-          return invocation(args);
-        },
-      },
-    );
-    assert.equal(childArgs.includes(task), false);
-    assert.equal(__testing.statusOf(result), "done");
-    if (task === "unicode") assert.match(__testing.modelFacingResult(result), /नमस्ते🙂/);
-  }
-});
-
-test("model policy loads a curated catalog and rejects unknown thinking levels", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-policy-test-"));
-  const configPath = path.join(directory, "models-allowlist.json");
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  fs.writeFileSync(configPath, JSON.stringify({
-    enabled: true,
-    default: "provider/model",
-    allowed: [{
-      id: "provider/model",
-      levels: { impossible: {} },
-      description: "test model",
-    }],
-  }));
-
-  const { policy, error } = __testing.loadModelPolicy(configPath);
-  assert.equal(error, undefined);
-  const registry = {
-    getAll: () => [{ provider: "provider", id: "model", reasoning: true }],
-  } as any;
-  const catalog = __testing.compactModelCatalog(policy, [], registry);
-  assert.deepEqual(catalog.models, [["provider/model", "", "test model"]]);
-  const validation = __testing.validateModelPolicy(policy, registry);
-  assert.match(validation.join("\n"), /not recognized by Pi/);
-});
-
-test("model policy applies a configured default thinking level", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-default-thinking-test-"));
-  const configPath = path.join(directory, "models-allowlist.json");
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  fs.writeFileSync(configPath, JSON.stringify({
-    enabled: true,
-    default: "provider/model",
-    defaultThinking: "high",
-    allowed: [{ id: "provider/model" }],
-  }));
-
-  const { policy, error } = __testing.loadModelPolicy(configPath);
-  assert.equal(error, undefined);
-  const registry = {
-    getAll: () => [{ provider: "provider", id: "model", reasoning: true, thinkingLevelMap: {} }],
-  } as any;
-  assert.equal(policy.defaultThinking, "high");
-  assert.deepEqual(__testing.resolveFreshModel(undefined, undefined, policy, registry), {
-    model: "provider/model",
-    thinking: "high",
-  });
-  assert.deepEqual(__testing.resolveFreshModel(undefined, "medium", policy, registry), { model: "provider/model" });
-  assert.equal(__testing.compactModelCatalog(policy, [], registry).defaultThinking, "high");
-});
-
-test("model policy rejects an unrecognized default thinking level", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-invalid-default-thinking-test-"));
-  const configPath = path.join(directory, "models-allowlist.json");
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  fs.writeFileSync(configPath, JSON.stringify({ enabled: true, defaultThinking: "invalid", allowed: ["provider/model"] }));
-  const { error } = __testing.loadModelPolicy(configPath);
-  assert.match(error!, /not recognized by Pi/);
-});
-
-test("model policy enforces exact models and the Pi-supported thinking subset", () => {
-  const policy = {
-    enabled: true,
-    allowed: new Set(["provider/model"]),
-    metadata: new Map([
-      ["provider/model", { id: "provider/model", levels: { low: {}, high: {} } }],
-    ]),
-    defaultModel: "provider/model",
-    configPath: "policy.json",
-  };
-
-  const registry = {
-    getAll: () => [{ provider: "provider", id: "model", reasoning: true, thinkingLevelMap: { high: null } }],
-  } as any;
-
-  assert.match(__testing.validateModelPolicy(policy as any, registry).join("\n"), /"high" is unsupported/);
-  assert.deepEqual(__testing.resolveFreshModel(undefined, "low", policy as any, registry), { model: "provider/model" });
-  assert.match(__testing.resolveFreshModel(undefined, "high", policy as any, registry).error!, /not allowed/);
-  assert.match(__testing.resolveFreshModel(undefined, undefined, policy as any, registry).error!, /Thinking level is required/);
-  assert.match(__testing.resolveFreshModel("other/model", "high", policy as any, registry).error!, /not allowed/);
-  assert.match(__testing.resolveFreshModel("provider/model", "max", policy as any, registry).error!, /Thinking level/);
-});
-
-test("model-facing envelope keeps orchestration fields and excludes accounting details", () => {
+test("the model-facing envelope keeps orchestration fields and excludes accounting details", () => {
   const result: any = {
-    task: "done",
-    label: "parallel-a",
-    resumed: true,
-    timeoutMs: 1000,
-    exitCode: 0,
-    model: "provider/model",
-    contextWindow: 200_000,
-    thinking: "high",
-    stopReason: "stop",
-    sessionFile: "/tmp/child.jsonl",
-    toolActivity: [],
-    messages: [],
-    partialText: "finished",
-    stderr: "",
-    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 84_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 }, turns: 3 },
+    task: "done", label: "parallel-a", resumed: true, timeoutMs: 1000, exitCode: 0, model: "provider/model",
+    contextWindow: 200_000, thinking: "high", stopReason: "stop", sessionFile: "/tmp/child.jsonl",
+    toolActivity: [], messages: [], partialText: "finished", stderr: "", usage: usage(84_000, 0.25),
   };
-  const output = __testing.modelFacingResult(result);
+  const output = modelFacingResult(result);
   assert.match(output, /^\[label=parallel-a status=done context=42%\/200k session=\/tmp\/child\.jsonl\]/);
-  assert.match(__testing.envelope({ ...result, contextWindow: undefined }), /context=84k /);
-  assert.doesNotMatch(__testing.envelope({ ...result, usage: { ...result.usage, totalTokens: 0 } }), /context=/);
+  assert.match(envelope({ ...result, contextWindow: undefined }), /context=84k /);
+  assert.doesNotMatch(envelope({ ...result, usage: usage(0) }), /context=/);
   assert.doesNotMatch(output, /model=|thinking=|turns=|cost=|timeoutMs=|resumed=|exit=/);
 });
 
-test("model-facing output is capped", () => {
+test("model-facing output is capped while scripts get it whole", () => {
+  const text = "x".repeat(70_000);
   const result: any = {
-    task: "large",
-    resumed: false,
-    exitCode: 0,
-    toolActivity: [],
-    messages: [{
-      role: "assistant",
-      content: [{ type: "text", text: "x".repeat(70_000) }],
-      provider: "test",
-      model: "model",
-      api: "openai-responses",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason: "stop",
-      timestamp: Date.now(),
-    }],
-    partialText: "",
-    stderr: "",
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, turns: 1 },
+    task: "large", resumed: false, exitCode: 0, toolActivity: [], partialText: "", stderr: "", usage: usage(0),
+    messages: [{ role: "assistant", content: [{ type: "text", text }], stopReason: "stop" }],
   };
-  const output = __testing.modelFacingResult(result);
+  const output = modelFacingResult(result);
   assert.ok(Buffer.byteLength(output) < 53_000);
   assert.match(output, /Output truncated/);
+  assert.equal(structuredResult(result).output, text);
 });

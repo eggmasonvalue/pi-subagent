@@ -34,12 +34,13 @@ Thin does not mean limited. Most useful subagent behavior falls out of a few com
 |---|---|
 | Focused work without consuming the parent's context | A fresh child Pi process |
 | Independent investigations | Multiple sibling calls, executed concurrently by Pi |
+| Scripted workflows | Codemode scripts that call `subagent` and branch on its structured result |
 | Clarification | The child returns its question; the parent resumes with an answer |
 | Progress review | A task-specific timeout returns control to the parent |
 | Correction or follow-up | Resume the same persisted child session |
 | Interrupt recovery | Abort flushes partial output and preserves the session |
 | Human observability | Live TUI updates, a `/subagents` transcript browser, and a durable session receipt |
-| Model and cost control | Per-run model, thinking, and tool configuration, with optional model/thinking policy and explicit tool inheritance, adjustment, or replacement |
+| Model and cost control | Per-run model, thinking, and tool configuration, with an optional model policy and subagent-specific defaults in `settings.json` |
 
 Together these cover the common delegation lifecycle without requiring background jobs, polling, mailboxes, workflow graphs, or a custom scheduler. The extension stays small while the parent model composes the primitives according to the task.
 
@@ -63,7 +64,9 @@ A resumed child keeps the context it accumulated previously. Corrections, answer
 
 For independent work, the parent emits multiple sibling `subagent` tool calls in one turn. Pi executes sibling tool calls concurrently and waits for all of them before returning their results to the parent model.
 
-The extension therefore does not need its own task-array syntax, scheduler, or parallel-result protocol.
+With [codemode](#codemode-workflows), a script does the same with `Promise.all`, and can branch, retry, or chain children on their structured results without spending parent turns.
+
+The extension therefore does not need its own task-array syntax, scheduler, workflow language, or parallel-result protocol.
 
 ### Receipts without context pollution
 
@@ -80,7 +83,11 @@ This extension provides one synchronous child run per tool call. It intentionall
 - polling, heartbeats, or background result delivery;
 - a separate child-to-parent messaging system.
 
-Pi skills and prompt templates can provide reusable delegation patterns. Pi's native parallel tool execution handles fan-out. Return, timeout, persisted sessions, and resume provide the control loop.
+Pi skills and prompt templates can provide reusable delegation patterns. Pi's native parallel tool execution and codemode scripts handle fan-out and workflows. Return, timeout, persisted sessions, and resume provide the control loop.
+
+### Why no async subagents
+
+A subagent that runs in the background while the parent keeps working would need its own job handles, polling or result injection, and lifecycle rules, all of it specific to this one tool. Asynchrony is a property of tool execution in general, so it belongs in Pi. Async subagents are waiting on Pi making all tool calls async; when it does, `subagent` will inherit that for free instead of reinventing it. Until then, sibling calls and codemode `Promise.all` cover concurrency, and `timeoutMs` returns control to the parent at chosen checkpoints.
 
 ## Install
 
@@ -152,12 +159,12 @@ subagent {
 |---|---|
 | `task` | Self-contained assignment. On resume, this is the answer, correction, or next direction appended to the existing child session. |
 | `label` | Optional correlation label for a fresh child. It is saved with the child and returned with every result of that child, including resumes. Useful when several sibling calls run concurrently. |
-| `model` | Pi model pattern or `provider/id` for a fresh run. With an enabled allowlist, it must exactly match an allowed ID. Omit it to use the policy default, or the child Pi default when policy is disabled. |
-| `thinking` | Reasoning level for a fresh run. It must be supported by the selected model and permitted by policy. When policy defines allowed levels, it is required and must match one of them; otherwise omission uses the child Pi default. |
+| `model` | Model for a fresh run. Omit it to use `subagent.defaultModel`. With a model list in settings, it must be one of the listed `provider/id` keys; without one, any Pi model pattern works. |
+| `thinking` | Thinking level for a fresh run. Omit it to use `subagent.defaultThinking`. With a model list, it must be a level the model permits; see [Models](#models-and-benchmark-informed-selection). |
 | `tools` | Tools for a fresh child. Omit to inherit the parent's active tools except `subagent` and `subagent_models`; `[]` disables tools; plain names are the child's exact tool set; a list of only `+name`/`-name` entries adds to or removes from the inherited set (`["-bash"]`, `["+subagent"]`). Add `subagent` only when the child must delegate further. |
 | `cwd` | Child working directory. Omit it to inherit the parent working directory. Setting it at startup controls path resolution and project-resource discovery. |
 | `timeoutMs` | Review horizon in milliseconds. No timeout is imposed when omitted. |
-| `resume` | Exact session JSONL path returned by an earlier call. Runtime configuration comes from the saved session. |
+| `resume` | Exact session JSONL path returned by an earlier call. Runtime configuration comes from the saved session and must still be permitted by the current model policy. |
 
 A child's identity and runtime configuration, namely `label`, `model`, `thinking`, `tools`, and `cwd`, are fixed when it is created and come from the saved session on resume. Start a new child when a different configuration is required.
 
@@ -218,97 +225,95 @@ Pi runs the calls concurrently, streams each tool row independently, and sends a
 
 Avoid assigning overlapping file edits to concurrent children unless the work has been explicitly partitioned.
 
+## Codemode workflows
+
+With Pi's codemode active, a script can call `tools.subagent()` and `tools.subagent_models()` directly. Both tools declare an output schema, so a script receives structured values instead of text:
+
+```ts
+tools.subagent(args): Promise<{
+  status: "done" | "failed" | "timeout" | "aborted";
+  output: string;          // final text, or partial text after a timeout or abort; never truncated
+  error?: string;
+  label?: string;
+  session?: string;        // pass as `resume` to continue this child
+  contextTokens?: number;  // tokens in the child's context after its last turn
+  contextWindow?: number;
+}>
+```
+
+A failed child resolves with `status: "failed"` instead of rejecting, so `Promise.all` keeps the other results. Invalid arguments and policy violations still reject.
+
+Supervision patterns become code the parent writes once per task:
+
+```js
+const areas = ["api", "persistence", "tests"];
+const runs = await Promise.all(areas.map((area) =>
+  tools.subagent({ label: area, task: `Map the ${area} layer. Return its entry points and risks.`, tools: ["read", "grep", "find"], timeoutMs: 600000 }),
+));
+for (const [i, run] of runs.entries()) {
+  if (run.status !== "timeout") continue;
+  // Checkpoint, then decide: the same loop as for direct calls.
+  runs[i] = await tools.subagent({ resume: run.session, task: "Report completed work, current step, blockers, and proposed next action. Do not continue." });
+}
+return runs.map((run) => `## ${run.label} (${run.status})\n${run.output}`).join("\n\n");
+```
+
+Only what the script returns reaches the parent model. Each child still persists its session and appears in `/subagents`, and the codemode row shows the script's calls.
+
+With `codemode.mode: "only"` in Pi's settings, `subagent` is reachable only through scripts. The supervision guidance travels with the tool's declaration either way.
+
 ## Models and benchmark-informed selection
 
-Model policy is optional. When enabled, it constrains which child models and thinking levels may be selected. The parent remains free to choose the best permitted configuration for each task.
+Child models are chosen separately from the main agent's. The model you talk to and the models it delegates to do different jobs, so the main agent's `defaultModel`, `defaultThinkingLevel`, and `modelThinkingLevels` settings never become subagent defaults under a model list.
 
-The zero-argument `subagent_models` tool returns the curated catalog on demand. Its compact response includes:
+The zero-argument `subagent_models` tool returns the permitted models, their thinking levels with optional benchmark scores, user-written descriptions, and the subagent defaults. The parent should normally call it once when model choice matters and reuse the result. The catalog is not injected into every system prompt. In the TUI, its row collapses to a one-line summary with any configuration issues; expand it to see the full catalog.
 
-- exact model IDs;
-- permitted thinking levels;
-- optional benchmark data for each level;
-- optional user-written descriptions;
-- the configured model and thinking defaults.
+### Configure
 
-The parent should normally call it once when model choice matters and reuse that result for later delegations. The catalog is not injected into every system prompt. In the TUI, its row collapses to a one-line summary and any allowlist issues; expand it to see the full catalog.
+Add a `subagent` key to Pi's `settings.json` (`~/.pi/agent/settings.json`, or a trusted project's `.pi/settings.json`):
 
-### Configure the allowlist
-
-Create the active policy from `extensions/subagent/models-allowlist.example.json`. From a package checkout, you can copy it with:
-
-From Bash:
-
-```bash
-mkdir -p ~/.pi/agent/pi-subagent
-cp extensions/subagent/models-allowlist.example.json ~/.pi/agent/pi-subagent/models-allowlist.json
-```
-
-From PowerShell:
-
-```powershell
-New-Item -ItemType Directory -Force "$HOME/.pi/agent/pi-subagent" | Out-Null
-Copy-Item extensions/subagent/models-allowlist.example.json "$HOME/.pi/agent/pi-subagent/models-allowlist.json"
-```
-
-The active policy is read from `~/.pi/agent/pi-subagent/models-allowlist.json` (`%USERPROFILE%\\.pi\\agent\\pi-subagent\\models-allowlist.json` on Windows), independently of whether the package was installed from npm or Git. `PI_CODING_AGENT_DIR` replaces the `~/.pi/agent` base when set.
-
-A model entry may be a plain ID or an object with per-level metadata:
-
-```json
+```jsonc
 {
-  "enabled": true,
-  "default": "github-copilot/gpt-5.3-codex",
-  "defaultThinking": "high",
-  "allowed": [
-    {
-      "id": "github-copilot/gpt-5.3-codex",
-      "description": "Strong default for coding tasks",
-      "levels": {
-        "low": {},
-        "high": {
-          "artificialAnalysis": {
-            "intelligence": 55.1,
-            "coding": 70.8,
-            "cost": 4.63
-          },
-          "deepSWE": {
-            "pass": 0.619,
-            "cost": 4.47
-          }
-        }
-      }
+  "subagent": {
+    "defaultModel": "github-copilot/gpt-6-luna",
+    "defaultThinking": "high",
+    "models": {
+      "github-copilot/gpt-6-luna": {
+        "thinking": ["medium", "high", "max"],
+        "description": "Small and fast. Use medium only for handyman tasks."
+      },
+      "github-copilot/gpt-6.1-sol": { "thinking": ["medium", "high"] },
+      "anthropic/claude-sonnet-5-5": {}
     }
-  ]
+  }
 }
 ```
 
-When a non-empty `levels` object is present, `thinking` must match one of the keys. Pi's model metadata narrows those configured keys to levels the model actually supports. Omitting `levels` permits the model's full Pi-supported set. `defaultThinking` supplies the thinking level for fresh children when `subagent.thinking` is omitted; an explicit tool argument takes precedence. If neither is set, the child Pi default is used when the selected model has no configured levels.
+| Field | Meaning |
+|---|---|
+| `models` | Permitted child models, keyed by exact `provider/id`. Omit it to permit any model Pi accepts. |
+| `models[id].thinking` | Permitted thinking levels. Pi's model metadata narrows them to the levels the model supports. Omit it to permit every supported level. |
+| `models[id].description` | Guidance shown to the parent by `subagent_models`. |
+| `defaultModel` | Model for fresh children that pass no `model`. With `models`, it must be one of them. |
+| `defaultThinking` | Thinking level for fresh children that pass no `thinking`, when the selected model permits it. |
 
-If the allowlist file is absent, model policy is disabled and the child may use Pi's normal model configuration.
+With a model list, every child runs with an explicit, permitted model and thinking level. An omitted value comes from the subagent defaults, or from the only level a model permits; otherwise the call fails and names the permitted values. Without a model list, omitted values fall back to the subagent defaults and then to the child Pi's own configuration.
 
-An allowlist entry that names a model Pi no longer knows, or a level the model no longer supports, is reported by `subagent_models` but rejects only the calls that select it. A resume is rejected when its saved model has become unknown or is no longer permitted.
+Project settings merge into user settings key by key, so a project can add models, change defaults, or withdraw a user-level model with `"provider/id": null`. Run `/reload` after editing settings.
 
-### Refresh optional benchmark data
+A model Pi no longer knows, or a level it no longer supports, is reported by `subagent_models` but blocks only the calls that select it. A resume is rejected when its saved model or thinking level is no longer permitted.
 
-The refresh scripts always update the active policy at
-`~/.pi/agent/pi-subagent/models-allowlist.json`, regardless of whether this package was
-installed from npm or Git. From a package checkout, run:
+### Benchmarks
+
+Optional benchmark scores live in a generated cache, `~/.pi/agent/pi-subagent/benchmarks.json`, not in your settings. Refresh it for every model in `subagent.models` that lists `thinking` levels:
 
 ```bash
-bun extensions/subagent/refresh-aa-benchmarks.ts
-bun extensions/subagent/refresh-deepswe-benchmarks.ts
+bun extensions/subagent/refresh-benchmarks.ts
 ```
 
-For tests or another policy file, pass an explicit path with `--config`:
+Scores come from [Artificial Analysis](https://artificialanalysis.ai). A failed lookup keeps the previous values. The script exits non-zero when any lookup fails or comes back incomplete. `PI_CODING_AGENT_DIR` replaces `~/.pi/agent` for both the settings it reads and the cache it writes.
 
-```bash
-bun extensions/subagent/refresh-aa-benchmarks.ts --config /tmp/models-allowlist.json
-bun extensions/subagent/refresh-deepswe-benchmarks.ts --config /tmp/models-allowlist.json
-```
-
-Benchmark values inform model choice; Pi's model metadata remains authoritative for capability validation. Users may omit benchmark fields and rely entirely on their own descriptions.
-
-`extensions/subagent/benchmark-config.ts` is the shared implementation used by the refresh scripts; it is not a user configuration file. The active user configuration is `~/.pi/agent/pi-subagent/models-allowlist.json`, and `--config` selects a different allowlist file for a refresh.
+Benchmark values inform model choice; Pi's model metadata remains authoritative for capability validation. Descriptions alone are enough if you prefer your own judgement.
 
 ## Context and capabilities
 
@@ -329,7 +334,7 @@ A result begins with a compact envelope followed by the child's final or partial
 <child output>
 ```
 
-Possible statuses include:
+For codemode scripts, the same facts arrive as a [structured value](#codemode-workflows) with the output uncapped. Possible statuses include:
 
 - `done`
 - `failed`
@@ -357,7 +362,7 @@ Expand the tool row with Pi's normal tool-output control for more detail. The pe
 
 ### Browsing child sessions
 
-`/subagents` lists the child sessions of the current conversation branch, one row per child, with running children first and then the most recent. Each row shows the child's label (or the start of its task), status, elapsed time, model, thinking level, and context fill. `/subagents <label>` opens a child directly, and labels tab-complete.
+`/subagents` lists the child sessions of the current conversation branch, including children started by codemode scripts, one row per child, with running children first and then the most recent. Each row shows the child's label (or the start of its task), status, elapsed time, model, thinking level, and context fill. `/subagents <label>` opens a child directly, and labels tab-complete.
 
 Opening a child shows its full transcript, rendered with Pi's own message and tool components so it reads like the main conversation. This includes earlier resumes and compactions. While the child runs, the transcript updates live as the child appends to its session, with in-progress text streamed underneath. Nothing is polled.
 
@@ -369,7 +374,7 @@ Opening a child shows its full transcript, rendered with Pi's own message and to
 | Enter | Close and copy `pi --session "<path>"` for continuing the child elsewhere once it has stopped |
 | Esc | Close |
 
-The browser is read-only and human-only: it adds nothing to the model's tools or context.
+Footer hints follow your configured keybindings. The browser is read-only and human-only: it adds nothing to the model's tools or context.
 
 ## Output limits
 
@@ -393,7 +398,7 @@ The extension relies on Pi rather than recreating it:
 - Pi processes provide isolation;
 - Pi JSON events provide live observation;
 - Pi sessions provide persistence and resume;
-- Pi tool execution provides sibling-call parallelism;
+- Pi tool execution provides sibling-call parallelism, and codemode provides scripted workflows;
 - Pi model and tool flags configure each child;
 - Pi's TUI supports compact and expanded rendering.
 
@@ -404,15 +409,16 @@ The extension supplies the thin control layer connecting those capabilities.
 ```text
 pi-subagent/
 ├── package.json
+├── CHANGELOG.md
 ├── README.md
 └── extensions/
     └── subagent/
-        ├── index.ts
-        ├── viewer.ts
-        ├── benchmark-config.ts
-        ├── models-allowlist.example.json
-        ├── refresh-aa-benchmarks.ts
-        └── refresh-deepswe-benchmarks.ts
+        ├── index.ts               tool registration and rendering
+        ├── child.ts               child process, results, resume metadata
+        ├── policy.ts              settings.json model policy and catalog
+        ├── viewer.ts              /subagents browser
+        ├── benchmarks.ts          benchmark cache
+        └── refresh-benchmarks.ts  benchmark refresh script
 ```
 
 ## License
