@@ -1,7 +1,8 @@
 // /subagents: a read-only browser for the child sessions of the current branch. Human-only; the model
-// never sees it. Finished children come from the branch's subagent tool results, running ones from
-// the in-memory registry the tool updates, and a transcript is the child's own session file
-// rendered with Pi's message and tool components, tailed as the running child appends to it.
+// never sees it. Finished calls come from the custom entries the tool appends to the branch, which
+// also covers calls made from codemode scripts; running ones come from the in-memory registry the
+// tool updates. A transcript is the child's own session file rendered with Pi's message and tool
+// components, tailed as the running child appends to it.
 
 import * as fs from "node:fs";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -33,39 +34,32 @@ import {
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Key, Markdown, matchesKey, SelectList, Spacer, stripTerminalSequences, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
-import type { SubagentResult } from "./index.ts";
+import { contextText, formatDuration, type RunSummary, statusOf, type SubagentResult } from "./child.ts";
 
-/**
- * Subagent calls this process has run, keyed by tool call id, holding the same result objects the
- * tool mutates. Pi persists the results of sibling calls only once the whole batch finishes, so a
- * finished call stays here until its result appears on the branch.
- */
+/** Custom session entry recording one finished subagent call. */
+export const RUN_ENTRY_TYPE = "subagent-run";
+
+/** Subagent calls this process is running, keyed by tool call id, holding the result objects the tool mutates. */
 export class LiveRuns {
-	private readonly runs = new Map<string, { result: SubagentResult; running: boolean }>();
+	private readonly runs = new Map<string, SubagentResult>();
 	private readonly listeners = new Set<() => void>();
 
 	update(toolCallId: string, result: SubagentResult): void {
-		this.runs.set(toolCallId, { result, running: true });
+		this.runs.set(toolCallId, result);
 		this.emit();
 	}
 
 	end(toolCallId: string): void {
-		const run = this.runs.get(toolCallId);
-		if (run) run.running = false;
+		this.runs.delete(toolCallId);
 		this.emit();
 	}
 
-	/** Drop a call whose result is now persisted on the branch. */
-	forget(toolCallId: string): void {
-		this.runs.delete(toolCallId);
-	}
-
-	entries(): IterableIterator<[string, { result: SubagentResult; running: boolean }]> {
+	entries(): IterableIterator<[string, SubagentResult]> {
 		return this.runs.entries();
 	}
 
 	isRunning(sessionFile: string): boolean {
-		for (const run of this.runs.values()) if (run.running && run.result.sessionFile === sessionFile) return true;
+		for (const result of this.runs.values()) if (result.sessionFile === sessionFile) return true;
 		return false;
 	}
 
@@ -81,9 +75,6 @@ export class LiveRuns {
 
 export interface ViewerDeps {
 	runs: LiveRuns;
-	statusOf(result: SubagentResult): string;
-	/** One-line status for a run, e.g. "done · 1m 5s · provider/model high · ctx 42%/200k". */
-	summarize(result: SubagentResult): string;
 	/** This extension's own tool definitions, so nested subagent rows render as they do in the parent. */
 	toolDefinitions: Record<string, ToolDefinition<any, any>>;
 }
@@ -93,8 +84,8 @@ interface Child {
 	label?: string;
 	/** The assignment that created the child; names it when it has no label. */
 	task: string;
-	/** The latest call's result: live while running, final otherwise. */
-	result: SubagentResult;
+	/** The latest call: live while running, final otherwise. */
+	result: RunSummary & { partialText?: string };
 	running: boolean;
 	order: number;
 }
@@ -102,7 +93,7 @@ interface Child {
 /** Child sessions of a branch, one per session file, running first and then most recent first. */
 function listChildren(branch: SessionEntry[], runs: LiveRuns): Child[] {
 	const children = new Map<string, Child>();
-	const record = (result: SubagentResult, running: boolean, order: number) => {
+	const record = (result: Child["result"], running: boolean, order: number) => {
 		if (!result.sessionFile) return;
 		const previous = children.get(result.sessionFile);
 		children.set(result.sessionFile, {
@@ -114,27 +105,30 @@ function listChildren(branch: SessionEntry[], runs: LiveRuns): Child[] {
 			order,
 		});
 	};
-	const calls = new Set<string>();
-	const persisted = new Set<string>();
+	const calls: string[] = [];
 	for (const entry of branch) {
-		if (entry.type !== "message") continue;
-		const message = entry.message;
-		if (message.role === "assistant") {
-			for (const part of message.content) if (part.type === "toolCall" && part.name === "subagent") calls.add(part.id);
+		if (entry.type === "custom" && entry.customType === RUN_ENTRY_TYPE && entry.data) {
+			record(entry.data as RunSummary, false, Date.parse(entry.timestamp));
+		} else if (entry.type === "message" && entry.message.role === "assistant") {
+			for (const part of entry.message.content) if (part.type === "toolCall") calls.push(part.id);
 		}
-		if (message.role !== "toolResult" || message.toolName !== "subagent") continue;
-		persisted.add(message.toolCallId);
-		const result = (message.details as { result?: SubagentResult } | undefined)?.result;
-		if (result) record(result, false, Date.parse(entry.timestamp));
 	}
-	// The branch carries a call as soon as the assistant message issuing it is persisted, before the
-	// call runs; its result follows once the whole sibling batch finishes. Until then the registry
-	// is the only record. Calls not on this branch belong to another branch or session.
-	for (const [toolCallId, { result, running }] of runs.entries()) {
-		if (persisted.has(toolCallId)) runs.forget(toolCallId);
-		else if (calls.has(toolCallId)) record(result, running, running ? Number.POSITIVE_INFINITY : (result.endedAt ?? 0));
+	// A running call belongs to this branch when it, or the codemode call whose script made it
+	// ("<parent id>/<n>"), was issued on the branch.
+	for (const [toolCallId, result] of runs.entries()) {
+		if (calls.some((id) => toolCallId === id || toolCallId.startsWith(`${id}/`))) record(result, true, Number.POSITIVE_INFINITY);
 	}
 	return [...children.values()].sort((a, b) => b.order - a.order);
+}
+
+/** One-line status, e.g. "done · 1m 5s · provider/model high · ctx 42%/200k". */
+function summaryLine(result: RunSummary): string {
+	return [
+		statusOf(result),
+		formatDuration(Math.max(0, (result.endedAt ?? Date.now()) - result.startedAt)),
+		[result.model, result.thinking].filter(Boolean).join(" "),
+		contextText(result) && `ctx ${contextText(result)}`,
+	].filter(Boolean).join(" · ");
 }
 
 function childName(child: Child): string {
@@ -143,10 +137,17 @@ function childName(child: Child): string {
 	return task.length > 40 ? `${task.slice(0, 40)}…` : task;
 }
 
-function statusIcon(child: Child, deps: ViewerDeps, theme: Theme): string {
-	const status = deps.statusOf(child.result);
+function statusIcon(child: Child, theme: Theme): string {
+	const status = statusOf(child.result);
 	if (status === "running") return theme.fg("warning", "⏳");
 	return status === "done" ? theme.fg("success", "✓") : theme.fg(status === "timeout" ? "warning" : "error", "✗");
+}
+
+/** "↑/↓ scroll · esc close" from the user's configured keys. */
+function hints(keybindings: KeybindingsManager, entries: [ids: string[], label: string][]): string {
+	return entries
+		.map(([ids, label]) => `${ids.map((id) => keybindings.getKeys(id as never).join("/")).filter(Boolean).join(" ")} ${label}`)
+		.join(" · ");
 }
 
 function builtInToolDefinitions(cwd: string): Record<string, ToolDefinition<any, any>> {
@@ -205,6 +206,7 @@ class Transcript implements Component {
 	private readonly tui: TUI;
 	private readonly theme: Theme;
 	private readonly keybindings: KeybindingsManager;
+	private readonly hints: string;
 	private readonly deps: ViewerDeps;
 	private readonly cwd: string;
 	private readonly done: (action: TranscriptAction) => void;
@@ -222,6 +224,13 @@ class Transcript implements Component {
 		this.tui = tui;
 		this.theme = theme;
 		this.keybindings = keybindings;
+		this.hints = hints(keybindings, [
+			[["tui.select.up", "tui.select.down", "tui.select.pageUp", "tui.select.pageDown"], "home/end scroll"],
+			[["tui.altScreen.previousPrompt", "tui.altScreen.nextPrompt"], "prompts"],
+			[["app.tools.expand"], "expand"],
+			[["tui.select.confirm"], "copy open command"],
+			[["tui.select.cancel"], "close"],
+		]);
 		this.deps = deps;
 		this.cwd = cwd;
 		this.done = done;
@@ -345,7 +354,7 @@ class Transcript implements Component {
 			if (component instanceof UserMessageComponent) prompts.push(lines.length);
 			lines.push(...component.render(width));
 		}
-		const partial = this.child.running ? this.child.result.partialText.trim() : "";
+		const partial = this.child.running ? (this.child.result.partialText ?? "").trim() : "";
 		if (partial) lines.push(...new Markdown(partial, 1, 0, getMarkdownTheme()).render(width));
 
 		const viewport = Math.max(1, this.tui.terminal.rows - 2);
@@ -353,9 +362,9 @@ class Transcript implements Component {
 		this.scroll = this.follow ? max : Math.min(Math.max(0, this.scroll), max);
 		this.layout = { lines: lines.length, viewport, prompts };
 
-		const header = `${statusIcon(this.child, this.deps, theme)} ${theme.fg("toolTitle", theme.bold(childName(this.child)))} ${theme.fg("dim", this.deps.summarize(this.child.result))}`;
+		const header = `${statusIcon(this.child, theme)} ${theme.fg("toolTitle", theme.bold(childName(this.child)))} ${theme.fg("dim", summaryLine(this.child.result))}`;
 		const position = lines.length > viewport ? ` · ${Math.round(((this.scroll + viewport) / lines.length) * 100)}%` : "";
-		const footer = theme.fg("dim", `↑↓ pgup/pgdn home/end scroll · ctrl+↑↓ prompts · ctrl+o expand · enter copy open command · esc close${position}`);
+		const footer = theme.fg("dim", `${this.hints}${position}`);
 		const window = lines.slice(this.scroll, this.scroll + viewport);
 		while (window.length < viewport) window.push("");
 		return [header, ...window, footer].map((line) => truncateToWidth(line.replace(OSC, ""), width));
@@ -395,13 +404,13 @@ function setExpanded(component: Component, expanded: boolean): void {
 	(component as { setExpanded?: (value: boolean) => void }).setExpanded?.(expanded);
 }
 
-function pickChild(ctx: ExtensionContext, children: Child[], deps: ViewerDeps): Promise<string | undefined> {
-	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
+function pickChild(ctx: ExtensionContext, children: Child[]): Promise<string | undefined> {
+	return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
 		const list = new SelectList(
 			children.map((child) => ({
 				value: child.sessionFile,
-				label: `${statusIcon(child, deps, theme)} ${childName(child)}`,
-				description: deps.summarize(child.result),
+				label: `${statusIcon(child, theme)} ${childName(child)}`,
+				description: summaryLine(child.result),
 			})),
 			Math.min(children.length, 12),
 			getSelectListTheme(),
@@ -411,7 +420,11 @@ function pickChild(ctx: ExtensionContext, children: Child[], deps: ViewerDeps): 
 		const container = new Container();
 		container.addChild(new Text(theme.fg("accent", theme.bold("Subagents on this branch")), 0, 0));
 		container.addChild(list);
-		container.addChild(new Text(theme.fg("dim", "↑↓ navigate · enter open · esc close"), 0, 0));
+		container.addChild(new Text(theme.fg("dim", hints(keybindings, [
+			[["tui.select.up", "tui.select.down"], "navigate"],
+			[["tui.select.confirm"], "open"],
+			[["tui.select.cancel"], "close"],
+		])), 0, 0));
 		return {
 			render: (width: number) => container.render(width),
 			invalidate: () => container.invalidate(),
@@ -437,7 +450,7 @@ export function registerViewer(pi: ExtensionAPI, deps: ViewerDeps): void {
 			for (const child of listChildren(sessionManager.getBranch(), deps.runs)) {
 				if (child.label?.startsWith(prefix) && !labels.has(child.label)) labels.set(child.label, child);
 			}
-			return [...labels].map(([label, child]) => ({ value: label, label, description: deps.summarize(child.result) }));
+			return [...labels].map(([label, child]) => ({ value: label, label, description: summaryLine(child.result) }));
 		},
 		async handler(args, ctx) {
 			if (ctx.mode !== "tui") {
@@ -453,7 +466,7 @@ export function registerViewer(pi: ExtensionAPI, deps: ViewerDeps): void {
 			let child = wanted ? children.find((candidate) => candidate.label === wanted) : undefined;
 			if (wanted && !child) ctx.ui.notify(`No subagent labelled "${wanted}" on this branch.`, "warning");
 			if (!child) {
-				const file = await pickChild(ctx, children, deps);
+				const file = await pickChild(ctx, children);
 				child = children.find((candidate) => candidate.sessionFile === file);
 			}
 			if (!child) return;

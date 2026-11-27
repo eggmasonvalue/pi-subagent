@@ -1,8 +1,8 @@
 {
   "name": "@eggmasonvalue/pi-subagent",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "type": "module",
-  "description": "Thin Pi subagent primitive: one synchronous call for isolated context, live progress, timeout supervision, resumable sessions, and per-task model/tool control, plus a live /subagents transcript browser.",
+  "description": "Thin Pi subagent primitive: isolated, resumable child sessions with live progress, timeout supervision, settings.json model policy, structured results for codemode workflows, and a live /subagents transcript browser.",
   "keywords": [
     "pi-package",
     "pi",
@@ -14,7 +14,9 @@
     "steerable",
     "observability",
     "fault-tolerant",
-    "isolated-context"
+    "isolated-context",
+    "codemode",
+    "workflows"
   ],
   "license": "MIT",
   "author": "eggmasonvalue",
@@ -48,6 +50,7 @@
   },
   "files": [
     "extensions",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ]
 }

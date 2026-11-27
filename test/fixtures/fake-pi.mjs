@@ -40,6 +40,11 @@ const usage = {
   cost: { input: 0.01, output: 0.02, cacheRead: 0.001, cacheWrite: 0.002, total: 0.033 },
 };
 
+if (task.includes("crash")) {
+  process.stderr.write("boom\n");
+  process.exit(3);
+}
+
 emit({ type: "session", version: 3, id: "fake-session", timestamp: new Date().toISOString(), cwd: process.cwd() });
 // Like Pi, the session file appears only once the first message is persisted, after the session event.
 createSessionFile();
